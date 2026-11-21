@@ -37,6 +37,9 @@ review are not covered by it; `EarnVault`, `EarnFees`, `ERC4626Engine`, `SingleZ
 Neither report covers:
 
 - `PropAMMEngine`, which is experimental;
+- the [Veda shared-vault stack](../modules/veda-shared-stacks.md) contracts under
+  `src/earn/engines/veda/shared/`, including `VedaLockstepEngine`, which is derived from the reviewed
+  `VedaEngine` but is a separate, unreviewed contract;
 - `EarnRewardsFactory`, `EarnFactory`, and `ERC4626EngineFactory`;
 - the current Foundry deployment scripts and the profile lifecycle tooling;
 - the oracle and rebalance controller used with a DirectPropAMM pool; and

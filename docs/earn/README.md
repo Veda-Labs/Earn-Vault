@@ -36,14 +36,15 @@ decisions. The architecture pages describe only the core and link here, so a cha
 capability updates one page. The shared engine contract and the recipe for a new engine kind are in
 [yield engines](integrations/engines.md).
 
-| Module                  | Page                                             | Covers                                                                     |
-| ----------------------- | ------------------------------------------------ | -------------------------------------------------------------------------- |
-| `engines`               | [Yield engines](integrations/engines.md)         | One page per engine kind, listed in its engine table                       |
-| `zone-router`           | [Zone router](modules/zone-router.md)            | `SingleZoneEarnRouter`, par conversion, Zone activation, go-live           |
-| `access-policy`         | [Access policy](modules/access.md)               | EarnShare TIP-403 whitelist, required members, `pnpm earn access`          |
-| `rewards`               | [Rewards](modules/rewards.md)                    | Contribution controller, Merkle distributor, `EarnRewardsFactory`          |
-| none                    | [Existing vault migration](modules/migration.md) | Holder opt-in, source-vault composition, stack replacement (E2E in `zone`) |
-| top-level `zone-router` | [`ZoneRouter`](../zone/zone-router.md)           | The `zoneRouter` field: a `ZoneRouter` mode and its `ZoneRouterFactory`    |
+| Module                  | Page                                                      | Covers                                                                     |
+| ----------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `engines`               | [Yield engines](integrations/engines.md)                  | One page per engine kind, listed in its engine table                       |
+| `zone-router`           | [Zone router](modules/zone-router.md)                     | `SingleZoneEarnRouter`, par conversion, Zone activation, go-live           |
+| `access-policy`         | [Access policy](modules/access.md)                        | EarnShare TIP-403 whitelist, required members, `pnpm earn access`          |
+| `rewards`               | [Rewards](modules/rewards.md)                             | Contribution controller, Merkle distributor, `EarnRewardsFactory`          |
+| none                    | [Veda shared-vault stacks](modules/veda-shared-stacks.md) | `VedaStackFactory`, vault registry, lockstep engine, role granter, overlay |
+| none                    | [Existing vault migration](modules/migration.md)          | Holder opt-in, source-vault composition, stack replacement (E2E in `zone`) |
+| top-level `zone-router` | [`ZoneRouter`](../zone/zone-router.md)                    | The `zoneRouter` field: a `ZoneRouter` mode and its `ZoneRouterFactory`    |
 
 ## Document ownership
 
@@ -57,6 +58,7 @@ capability updates one page. The shared engine contract and the recipe for a new
 | Shared engine contract, installation checks, and adding an engine kind         | [Yield engines](integrations/engines.md)                                                                               |
 | One engine kind's contracts, valuation, exits, deployment, and operations      | [ERC-4626](modules/erc4626-engine.md), [Veda](modules/veda.md), [PropAMM](modules/propamm.md), [Hold](modules/hold.md) |
 | Capability contracts, flows, operations, and rationale                         | [Capability modules](#capability-modules)                                                                              |
+| Many stacks on one BoringVault: vault registry and stack factory               | [Veda shared-vault stacks](modules/veda-shared-stacks.md)                                                              |
 | Completed Sigma Prime audit reports, finding status, and post-audit coverage   | [Audits](audit/README.md)                                                                                              |
 | Agent entry-point selection, access checks, and integration troubleshooting    | [Agent guide](integrations/agent-guide.md)                                                                             |
 | Client integration, approvals, simulation, and revert handling                 | [Client integration](integrations/client.md)                                                                           |

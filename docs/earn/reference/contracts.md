@@ -22,6 +22,7 @@ scope is in [audits](../audit/README.md#scope).
 | Current engine and the `IEarnEngine` capability interfaces    | Per stack          | [Yield engines](../integrations/engines.md)                |
 | `ERC4626Engine`, `ERC4626EngineFactory`                       | Per stack, network | [ERC-4626](../modules/erc4626-engine.md)                   |
 | `VedaEngine`, `VedaPeripheryRegistry`, `VedaForwardingSolver` | Per Veda stack     | [Veda](../modules/veda.md#contracts)                       |
+| `VedaStackFactory`, its registry, engine and authorizers      | Per BoringVault    | [Shared-vault stacks](../modules/veda-shared-stacks.md)    |
 | `PropAMMEngine` (experimental)                                | Per stack          | [PropAMM](../modules/propamm.md)                           |
 | `SingleZoneEarnRouter`                                        | Per Zone route     | [Zones](../modules/zone-router.md#router-contract)         |
 | `EarnContributionController`, `EarnMerkleRewardDistributor`   | Optional per stack | [Rewards](../modules/rewards.md)                           |
