@@ -514,9 +514,14 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         assertFalse(unnamed.isAuthorizerBound());
         assertTrue(factory.isAuthorizerBound());
 
-        vm.prank(operator);
+        vm.startPrank(operator);
         vm.expectRevert(VedaStackFactory.AuthorizerNotBound.selector);
         unnamed.createStack(_nextJob(), _engineParams(), _coreParams(STACK_A), address(0));
+        // Not even a pending engine.
+        vm.expectRevert(VedaStackFactory.AuthorizerNotBound.selector);
+        unnamed.deployEngine(_nextJob(), _engineParams());
+        vm.stopPrank();
+        assertEq(unnamed.engineCount(), 0);
     }
 
     function testAFactoryOnAnotherRegistryOfTheSameVaultCannotBeNamed() public {
@@ -580,7 +585,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         VedaStackFactory.Config memory config = _factoryConfig();
         config.engineDeployer = VedaEngineDeployer(address(hostile));
         config.engineDeployerCodeHash = address(hostile).codehash;
-        VedaStackFactory hostileFactory = new VedaStackFactory(config);
+        VedaStackFactory hostileFactory = _newBoundFactory(config);
 
         // Not a contract, owned by someone else, already bound, or already one of its own stacks.
         address[4] memory candidates;
@@ -658,7 +663,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         config.engineDeployer = VedaEngineDeployer(address(reentrant));
         config.engineDeployerCodeHash = address(reentrant).codehash;
         config.operator = address(reentrant);
-        VedaStackFactory guarded = new VedaStackFactory(config);
+        VedaStackFactory guarded = _newBoundFactory(config);
         reentrant.setFactory(guarded);
 
         vm.expectRevert(VedaStackFactory.ReentrantCall.selector);
@@ -898,9 +903,12 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
             factory.revokeEngine(address(engine));
         }
 
+        assertTrue(factory.canEngineUseTeller(address(engine)));
+        assertFalse(factory.canEngineUseTeller(stranger));
         vm.prank(pauser);
         factory.revokeEngine(address(engine));
         assertEq(uint256(factory.stack(address(engine)).status), uint256(VedaStackFactory.EngineStatus.Revoked));
+        assertFalse(factory.canEngineUseTeller(address(engine)));
         assertFalse(_canCall(address(engine), address(teller), ITeller.bulkDeposit.selector));
         assertFalse(_canCall(address(engine), address(teller), ITeller.bulkWithdraw.selector));
         assertFalse(_canCall(address(engine), address(queue), IBoringQueue.requestOnChainWithdraw.selector));

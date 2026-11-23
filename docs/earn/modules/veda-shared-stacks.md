@@ -62,8 +62,9 @@ Publication refuses a tuple unless:
 - the Teller is the vault's owner or its authority allows it `enter` and `exit`, which an engine does
   not check before it activates a tuple; and
 - where the Teller keeps an [account allowlist](#teller-allowlist), a Queue that applies one applies
-  this Teller's, and the stock solver is on it, because the solver redeems every settled request
-  through the Teller.
+  this Teller's, and the list admits the stock solver, because the solver redeems every settled
+  request through the Teller. A list that is not enforced admits every account;
+  [`assertSetup`](#setup) is what requires the solver to be on an enforced one.
 
 These checks do not show that a module's code is benign, that the stock solver holds its Veda
 permissions, or that the Earn stacks are admitted to the new modules.
@@ -112,7 +113,8 @@ meaning unrestricted; a nonzero `newTransferPolicyAdmin` instead creates a TIP-4
 administered by that address and attaches it. A protected stack is unusable until its policy's
 administrator authorizes the [required members](access.md#required-members).
 
-The factory builds nothing until the administrator names it on the granter (`AuthorizerNotBound`). It
+The factory builds nothing, not even a pending engine, until the administrator names it on the
+granter (`AuthorizerNotBound`). It
 authorizes only contracts it built itself. Checking an engine's code would not be enough, because a
 canonical engine lets its owner bind any EarnVault: the factory owns each engine from construction
 until it binds it, and refuses any engine it did not deploy in its own call (`EngineNotPending`),
@@ -155,6 +157,8 @@ a revoked engine unless the Teller's list is what admits it. `isEngineReady(engi
 Teller and Queue the engine itself uses, which are the published ones only once its owner has
 activated them: an active stack whose engine they allow its calls and, where the Teller keeps a
 list, admit. It does not cover a paused Teller, a deposit cap or the stack's own controls.
+`canEngineUseTeller(engine)` is the check after a revocation: whether the engine's Teller would
+still take a deposit from it or pay it an immediate exit, whatever the factory's record says.
 `isForwarderReady(forwarder, solver)` reads the wiring and permissions of the queued path, which
 may go unused for a long time: the forwarder is active, fixed to the Queue and Teller its engine
 uses now and, once the engine is on the published tuple, to the published stock solver, admitted by
@@ -207,9 +211,10 @@ cannot list a role's holders, so no contract here can check this:
 - a number that already carries a capability elsewhere (a manager, an Accountant) gives it to every
   engine or forwarding solver. Only the custody and role-administration functions above are checked.
 
-Pointing the RolesAuthority's `authority` elsewhere stops new grants and the granter's role
+Pointing the RolesAuthority's `authority` elsewhere stops new grants, `relist` and the granter's role
 revocations alike. Roles already granted stay until the owner clears them or removes the roles'
-capabilities, so pause and revoke through the factory first.
+capabilities, so pause and revoke through the factory first. The granter keeps its permission on the
+Teller until the owner takes that away too, and a revocation still delists through it.
 
 ### Teller allowlist
 
@@ -234,7 +239,8 @@ The role is granted either way, since a Queue and a stock solver gate their call
 vault. The owner lets the granter call `setAllowedAccounts` on a Teller that keeps a list, through a
 role nothing else holds. That function takes any accounts, so only the granter's code keeps the
 permission to Earn engines. `listedOn(engine)` is its record: the Teller it last listed the engine
-on, `address(1)` once it revoked an engine it had listed, zero for an engine it never listed.
+on, `address(1)` for an engine revoked through its factory, listed or not, until it is authorized
+again, and zero for an engine it never listed.
 
 | Function                    | Caller                    | What it writes                                                                |
 | --------------------------- | ------------------------- | ----------------------------------------------------------------------------- |
@@ -248,19 +254,23 @@ on, `address(1)` once it revoked an engine it had listed, zero for an engine it 
 
 - **Listing follows the engine role.** `relist` lists a contract that holds the engine role, which a
   named factory or the owner gave it, and skips everything else, so one revoked engine does not fail
-  a batch. It is how the vault's engines reach a newly published Teller before their owners activate
+  a batch. It reverts unless the granter is still the RolesAuthority's authority, since only then
+  does the role say who is an engine. It is how the vault's engines reach a newly published Teller before their owners activate
   it, and how engines authorized before the flag was set reach the list. It skips an engine whose
   latest listing by the granter was on this Teller.
 - **Revoking removes the role and each listing independently.** A RolesAuthority that no longer
   admits the granter does not keep an engine listed (`EngineRoleRevocationDeferred`), and a Teller
-  that cannot be written does not keep the role (`EngineDelistingDeferred`, which `redelist`
-  finishes). The engine is recorded so that nothing here lists it again. The call reverts only when
-  the role could not be cleared and there was no listing to remove.
+  that still lists the engine and cannot be written does not keep the role
+  (`EngineDelistingDeferred`, which `redelist` finishes). The engine is recorded as revoked whatever
+  the flag says, so that nothing here lists it again and `redelist` takes it off a Teller it reaches
+  later. The call reverts only when the role could not be cleared and no listing was found.
 - **Where it delists.** On the published Teller, which the engine's owner could activate; on the
   Teller the engine reports, which it uses until then; and on the Teller the granter last listed it
   on. An engine can activate only the published Teller, so a listing left on any other Teller is one
-  it cannot use. An engine is delisted when the granter listed it or when it holds the engine role
-  while the flag is set; the stock solver and any other account are not the granter's to remove.
+  it cannot use. A Teller that does not answer `allowedAccounts` keeps no list and is passed over.
+  The granter looks for listings when it listed the engine or the engine holds the engine role,
+  whatever the flag says, so it also delists an engine someone else listed; the stock solver and
+  any other account are not the granter's to remove.
 
 A forwarding solver holds no shares and is never listed. The stock solver redeems settled requests
 through the Teller and must be on the list; the administrator lists it, and publication checks it.
@@ -288,6 +298,8 @@ whose engine the list does not admit (`NotListedOnTeller`), and `assertSetup` re
 engine between the two calls, which makes admission a second key's decision at one transaction per
 stack. Before listing, that key confirms `stack(engine).status` is pending in the factory it trusts:
 the engine deployer is open to anyone, so an engine's code proves nothing about who built it.
+Revoking such an engine still delists it where the granter may write the list; where it may not,
+`EngineDelistingDeferred` names the Teller and the key that keeps the list delists it.
 
 ## Forwarder steward
 
@@ -369,7 +381,7 @@ the publication batch:
   activate. Both functions read the granter's record and the role table when they run, so an engine
   revoked while the batch waits is handled correctly. Listing engines on the new Teller directly
   bypasses the record: a revocation still delists an engine that holds the engine role, and
-  `redelist` removes one revoked before the Teller was published; and
+  `redelist` removes one revoked through its factory before the Teller was published; and
 - end with `granter.assertSetup(registry, factory)`.
 
 Then, for each stack:
@@ -400,8 +412,9 @@ move it.
   [flag](#teller-allowlist) set, revoking also delists the engine, which is what stops it on a vault
   that opens the Teller to every caller, and requests it already queued wait until it is reinstated
   or pass their deadline. Watch the granter's `EngineDelistingDeferred` and
-  `EngineRoleRevocationDeferred`: until the named Teller or the role is cleared the engine may still
-  work. Finish a deferred delisting with `granter.redelist`; a role the granter could not clear is
+  `EngineRoleRevocationDeferred`, and read `canEngineUseTeller(engine)` after every revocation: the
+  factory records the engine as revoked either way, and until the named Teller or the role is
+  cleared the engine may still work. Finish a deferred delisting with `granter.redelist`; a role the granter could not clear is
   the RolesAuthority owner's to clear. `reinstateEngine` lists an engine on the published Teller, so
   for an engine that has not activated it, the owner activates first or the administrator lists the
   engine on its own Teller directly.
@@ -421,8 +434,9 @@ new stacks.
 Once the administrator stops naming a factory, that factory can change nothing. Its stacks keep
 their roles and listings, are still carried to a new Teller by `relist`, and keep working, but they
 cannot get a forwarding solver for a newly published Queue, and only the administrator can revoke
-them: with `setUserRole` on the RolesAuthority and `setAllowedAccounts` on the Teller. Each leaves
-the factory's own record and the granter's unchanged.
+them: with `setUserRole` on the RolesAuthority first, and then `setAllowedAccounts` on the Teller. In
+that order, because an engine that still holds the role can be carried back onto a Teller's list by
+anyone. Each leaves the factory's own record and the granter's unchanged.
 
 ## Trust and failure modes
 
@@ -471,8 +485,10 @@ bound to it. The engine in every stack is the released `VedaEngine`, whose own s
   refuses its engine, revoking delists and stops deposits, exits and queued settlement, the role and
   the listing are each removed when the other cannot be, a direct delisting is not undone, a newly
   published Teller is listed through `relist` before an owner activates it, revoking stops an engine
-  on the Teller it uses and on the one it could activate, a vault moves from a Teller that gates
-  callers to one that admits by account under the same granter and factory, and a stateful
+  on the Teller it uses and on the one it could activate and also delists an engine someone else
+  listed, a vault moves from a Teller that gates callers to one that admits by account under the
+  same granter and factory, an engine revoked before the vault had a list stays off the one that
+  comes later, and a stateful
   invariant that the Teller's list holds the stock solver and exactly the active engines.
 - `VedaForwarderSteward.t.sol`: a forwarder built with the vault's solver approved settles with no
   transaction from its owner, the list reaches every forwarder through `seed` and `prune`, and

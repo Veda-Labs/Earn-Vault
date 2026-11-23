@@ -7,7 +7,7 @@ pragma solidity ^0.8.36;
 // list admits it, that revoking a stack delists it wherever it could still be used, and that the same
 // granter serves a Teller without a list while the flag is clear.
 // forge-lint: disable-start(multi-contract-file,unsafe-typecast)
-import { Test } from "forge-std/Test.sol";
+import { Test, Vm } from "forge-std/Test.sol";
 import { EarnVault } from "../../../../../src/earn/core/EarnVault.sol";
 import { VedaEngine } from "../../../../../src/earn/engines/veda/VedaEngine.sol";
 import { VedaForwardingSolver } from "../../../../../src/earn/engines/veda/VedaForwardingSolver.sol";
@@ -202,6 +202,43 @@ contract VedaRoleGranterAllowlistTest is VedaAllowlistStackTestBase {
         assertTrue(factory.isEngineReady(engine));
         assertEq(granter.listedOn(engine), address(0));
         assertEq(_deposit(EarnVault(earnVault), user, 10e6), 10e6);
+
+        // The granter did not list this engine, and the flag is clear. Revoking it still takes it off
+        // the list, because the engine holds the engine role and the list is what admits it here.
+        vm.prank(pauser);
+        factory.revokeEngine(engine);
+        assertFalse(listed.allowedAccounts(engine));
+        assertEq(granter.listedOn(engine), DELISTED);
+        assertFalse(factory.canEngineUseTeller(engine));
+        _expectDepositRefused(EarnVault(earnVault), "NOT_ALLOWED");
+    }
+
+    function testRevokingAnEngineSomeoneElseListedSaysSoWhenTheGranterCannotDelistIt() public {
+        // The list is kept by a second key, and the granter was never allowed to write it.
+        vm.startPrank(admin);
+        granter.setTellerAllowlist(false);
+        rolesAuthority.setUserRole(address(granter), LISTER_ROLE, false);
+        vm.stopPrank();
+        vm.prank(operator);
+        address engine = factory.deployEngine(_nextJob(), _engineParams());
+        _setListedDirectly(listed, engine, true);
+        vm.prank(operator);
+        (address earnVault,) = factory.finalizeStack(engine, _coreParams(STACK_A), address(0));
+
+        // The role goes, the listing stays, and the revocation says which Teller still lists it.
+        vm.expectEmit(true, true, false, true, address(granter));
+        emit VedaRoleGranter.EngineDelistingDeferred(engine, address(teller));
+        vm.prank(pauser);
+        factory.revokeEngine(engine);
+        assertFalse(rolesAuthority.doesUserHaveRole(engine, EARN_ENGINE_ROLE));
+        assertTrue(factory.canEngineUseTeller(engine));
+        assertEq(_deposit(EarnVault(earnVault), user, 1e6), 1e6);
+
+        // Whoever keeps the list finishes it.
+        _setListedDirectly(listed, engine, false);
+        assertFalse(factory.canEngineUseTeller(engine));
+        vm.prank(stranger);
+        assertEq(granter.redelist(_one(engine)), 1);
     }
 
     function testAStackIsNotBuiltWhenTheGranterCannotWriteTheTellersList() public {
@@ -369,8 +406,17 @@ contract VedaRoleGranterAllowlistTest is VedaAllowlistStackTestBase {
         factory.revokeEngine(address(engineB));
         assertFalse(listed.allowedAccounts(address(engineB)));
         assertTrue(rolesAuthority.doesUserHaveRole(address(engineB), EARN_ENGINE_ROLE));
-        // The role it kept does not make it eligible for the list again.
+        assertEq(granter.listedOn(address(engineB)), DELISTED);
+
+        // While the granter is cut off, the role table no longer says who is an engine, so nobody
+        // carries anything to a Teller's list.
+        vm.expectRevert(abi.encodeWithSelector(VedaRoleGranter.NotRolesAuthorityAuthority.selector, address(0)));
+        granter.relist(_one(address(engineB)));
+        // Restored, the role the engine kept still does not make it eligible for the list again.
+        vm.prank(admin);
+        rolesAuthority.setAuthority(address(granter));
         assertEq(_relist(address(engineB)), 0);
+        assertFalse(listed.allowedAccounts(address(engineB)));
     }
 
     function testARevocationStandsWhenNeitherTheRoleNorTheListingCanBeRemovedYet() public {
@@ -385,23 +431,26 @@ contract VedaRoleGranterAllowlistTest is VedaAllowlistStackTestBase {
         // Neither the role nor the Teller's entry can be removed now. The granter still records the
         // engine as revoked, so the revocation is not lost: nothing can carry the engine to another
         // Teller, and anyone finishes the delisting once the Teller can be written.
-        vm.expectEmit(true, false, false, true, address(granter));
-        emit VedaRoleGranter.EngineRoleRevocationDeferred(address(engine));
         vm.expectEmit(true, true, false, true, address(granter));
         emit VedaRoleGranter.EngineDelistingDeferred(address(engine), address(teller));
+        vm.expectEmit(true, false, false, true, address(granter));
+        emit VedaRoleGranter.EngineRoleRevocationDeferred(address(engine));
         vm.prank(pauser);
         factory.revokeEngine(address(engine));
         assertEq(uint256(factory.stack(address(engine)).status), uint256(VedaStackFactory.EngineStatus.Revoked));
         assertEq(granter.listedOn(address(engine)), DELISTED);
-        assertEq(_relist(address(engine)), 0);
-        // Until then the engine still works, which the events say.
+        // Until then the engine still works, which the events say and which the factory shows: it
+        // is revoked and its Teller still serves it.
         assertTrue(listed.allowedAccounts(address(engine)));
+        assertFalse(factory.isEngineReady(address(engine)));
+        assertTrue(factory.canEngineUseTeller(address(engine)));
         assertEq(_deposit(earnVault, user, 1e6), 1e6);
 
         vm.prank(admin);
         _grantListerCapability(teller);
         vm.prank(stranger);
         assertEq(granter.redelist(_one(address(engine))), 1);
+        assertFalse(factory.canEngineUseTeller(address(engine)));
         _expectDepositRefused(earnVault, "NOT_ALLOWED");
     }
 
@@ -973,11 +1022,15 @@ contract VedaTellerMigrationTest is VedaRoleStackTestBase {
         assertEq(granter.listedOn(address(engine)), address(0));
         assertTrue(factory.isEngineReady(address(engine)));
 
-        // Revoking writes to no Teller, and nothing is recorded for a list that does not exist.
+        // Revoking writes to no Teller and reports nothing deferred: a Teller without a list has
+        // nothing to remove. The engine is recorded as revoked for any Teller that comes later.
+        vm.recordLogs();
         vm.prank(pauser);
         factory.revokeEngine(address(engine));
-        assertEq(granter.listedOn(address(engine)), address(0));
+        _assertNothingDeferred();
+        assertEq(granter.listedOn(address(engine)), address(1));
         assertFalse(factory.isEngineReady(address(engine)));
+        assertFalse(factory.canEngineUseTeller(address(engine)));
         asset.mint(user, 1e6);
         vm.startPrank(user);
         asset.approve(address(earnVault), 1e6);
@@ -986,7 +1039,92 @@ contract VedaTellerMigrationTest is VedaRoleStackTestBase {
         vm.stopPrank();
         address[] memory engines = new address[](1);
         engines[0] = address(engine);
-        assertEq(granter.redelist(engines), 0);
+        assertEq(granter.redelist(engines), 1);
+
+        // Reinstated, it is an ordinary engine again.
+        vm.prank(admin);
+        factory.reinstateEngine(address(engine));
+        assertEq(granter.listedOn(address(engine)), address(0));
+        assertEq(_deposit(earnVault, user, 1e6), 1e6);
+    }
+
+    function testAnEngineRevokedBeforeTheVaultHadAListStaysOffTheListThatComesLater() public {
+        (VedaEngine revoked, EarnVault revokedVault,) = _createStack(STACK_A);
+        (VedaEngine unmoved, EarnVault unmovedVault,) = _createStack(STACK_B);
+        vm.prank(pauser);
+        factory.revokeEngine(address(revoked));
+
+        // The vault moves to a Teller that admits by account, and the administrator lists every
+        // engine the factory ever built on it directly, the revoked one included.
+        (AllowlistTeller next,,) = _publishAllowlistModules();
+        vm.startPrank(admin);
+        _list(next, address(revoked));
+        _list(next, address(unmoved));
+        vm.stopPrank();
+        assertTrue(next.allowedAccounts(address(revoked)));
+
+        // Anyone takes the revoked engine off, and only that one.
+        address[] memory engines = new address[](2);
+        engines[0] = address(revoked);
+        engines[1] = address(unmoved);
+        vm.prank(stranger);
+        assertEq(granter.redelist(engines), 1);
+        assertFalse(next.allowedAccounts(address(revoked)));
+        assertTrue(next.allowedAccounts(address(unmoved)));
+        _activate(revoked, revokedVault);
+        assertFalse(factory.canEngineUseTeller(address(revoked)));
+
+        // An engine still on the first Teller, which keeps no list, is revoked without a false
+        // report about that Teller, and is taken off the new one.
+        assertEq(address(unmoved.teller()), address(teller));
+        vm.recordLogs();
+        vm.prank(pauser);
+        factory.revokeEngine(address(unmoved));
+        _assertNothingDeferred();
+        assertFalse(next.allowedAccounts(address(unmoved)));
+        vm.prank(stranger);
+        assertEq(granter.redelist(engines), 2);
+        asset.mint(user, 1e6);
+        vm.startPrank(user);
+        asset.approve(address(unmovedVault), 1e6);
+        vm.expectRevert(bytes("UNAUTHORIZED"));
+        unmovedVault.deposit(1e6, user, 1);
+        vm.stopPrank();
+    }
+
+    /// @dev The administrator's publication batch for a Teller that admits by account, with the flag.
+    function _publishAllowlistModules()
+        private
+        returns (AllowlistTeller next, AuthedQueue nextQueue, AuthedSolver nextSolver)
+    {
+        next = new AllowlistTeller(address(0), address(rolesAuthority), vault, address(accountant));
+        nextQueue = new AllowlistQueue(address(0), address(rolesAuthority), vault, address(accountant));
+        nextSolver = new AuthedSolver(address(0), address(rolesAuthority), nextQueue);
+        vm.startPrank(admin);
+        _grantTellerVaultRoles(next);
+        _grantStockSolverRoles(next, nextQueue, nextSolver);
+        _grantEarnRoleCapabilities(next, nextQueue, nextSolver);
+        _configureAllowlist(next, nextQueue, nextSolver);
+        _grantListerCapability(next);
+        rolesAuthority.setUserRole(address(granter), LISTER_ROLE, true);
+        registry.publish(
+            ITeller(address(next)),
+            IBoringQueue(address(nextQueue)),
+            IAccountant(address(accountant)),
+            IBoringSolver(address(nextSolver))
+        );
+        granter.setTellerAllowlist(true);
+        granter.assertSetup(IVedaVaultRegistry(address(registry)), address(factory));
+        vm.stopPrank();
+    }
+
+    /// @dev No recorded log says a delisting or a role removal was left undone.
+    function _assertNothingDeferred() private {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(logs[i].topics[0] != VedaRoleGranter.EngineDelistingDeferred.selector);
+            assertTrue(logs[i].topics[0] != VedaRoleGranter.EngineRoleRevocationDeferred.selector);
+        }
     }
 }
 

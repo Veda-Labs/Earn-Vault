@@ -490,6 +490,22 @@ contract VedaStackFactory {
         return target == address(0) && _isListed(engine, address(VedaEngine(engine).teller()));
     }
 
+    /// @notice Whether the Teller `engine` uses would still take a deposit from it or pay it an
+    ///         immediate exit, whatever its status here: the Teller's authority allows the call and
+    ///         its list admits the engine. False for an address this factory did not deploy.
+    /// @dev The check to make after {revokeEngine}. The granter removes the role and each listing
+    ///      where it can and reports what it could not, and a revoked engine this still returns true
+    ///      for is one that still works. It does not cover the Queue, a paused Teller or a deposit
+    ///      cap.
+    function canEngineUseTeller(address engine) external view returns (bool) {
+        if (_stacks[engine].status == EngineStatus.None) return false;
+        address teller = address(VedaEngine(engine).teller());
+        (bool checked, bool allowed) = VedaTellerAllowlist.tryIsDepositAllowed(teller, engine);
+        if (_canCall(engine, teller, ITeller.bulkDeposit.selector) && (!checked || allowed)) return true;
+        (checked, allowed) = VedaTellerAllowlist.tryIsWithdrawAllowed(teller, engine);
+        return _canCall(engine, teller, ITeller.bulkWithdraw.selector) && (!checked || allowed);
+    }
+
     /// @notice Whether the wiring and permissions a queued exit needs are in place for `forwarder` and
     ///         `solver`: it is an active forwarding solver of this factory, fixed to the Queue and
     ///         Teller its engine uses now and, once the engine is on the published tuple, to the
@@ -532,6 +548,7 @@ contract VedaStackFactory {
     // ------------------------------------------------------------------
 
     function _deployEngine(bytes32 jobId, EngineParams calldata engineParams) private returns (address engine) {
+        _requireAuthorizerBound();
         if (jobId == bytes32(0)) revert EmptyJobId();
         address built = engineOf[jobId];
         if (built != address(0)) revert JobAlreadyBuilt(jobId, built);

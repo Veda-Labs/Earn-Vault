@@ -53,8 +53,9 @@ import { VedaTellerAllowlist } from "./VedaTellerAllowlist.sol";
 ///      code: the owner still has to know what code it is naming.
 ///
 ///      WITHDRAWING IT. The RolesAuthority's owner cuts this contract off by pointing `authority`
-///      elsewhere. That stops new grants and also this contract's role revocations: roles already
-///      granted stay until the owner clears them or removes the roles' capabilities. Pausing
+///      elsewhere. That stops new grants, {relist}, and also this contract's role revocations: roles
+///      already granted stay until the owner clears them or removes the roles' capabilities, and a
+///      revocation still delists. Pausing
 ///      registrations and revoking through a factory are the fast controls; repointing the authority
 ///      is the owner's final one.
 ///
@@ -84,7 +85,7 @@ import { VedaTellerAllowlist } from "./VedaTellerAllowlist.sol";
 /// @custom:invariant engineRole != forwarderRole && !isFactory[address(0)]
 /// @custom:invariant address(rolesAuthority) != address(0) && address(registry) != address(0) && vault != address(0)
 contract VedaRoleGranter is IVedaStackAuthorizer, IAuthority {
-    /// @dev Marks an engine this contract listed and whose authorization was since revoked. Never a Teller.
+    /// @dev Marks an engine whose authorization was revoked through its factory. Never a Teller.
     address private constant DELISTED = address(1);
 
     IRolesAuthority public immutable rolesAuthority;
@@ -102,15 +103,15 @@ contract VedaRoleGranter is IVedaStackAuthorizer, IAuthority {
     ///         it on the published Teller. Clear for a Teller that gates callers only.
     bool public tellerAllowlist;
     /// @notice The Teller this contract last listed `engine` on. Zero for an engine it never listed,
-    ///         and `address(1)` for one whose authorization was revoked after it was listed.
+    ///         and `address(1)` for an engine revoked through its factory, listed or not, until it is
+    ///         authorized again.
     mapping(address engine => address teller) public listedOn;
 
     event EarnRoleUpdated(address indexed account, uint8 indexed role, bool enabled);
     event StackFactoryChanged(address indexed factory, bool named);
     event TellerAllowlistChanged(bool enabled);
     event EngineListingChanged(address indexed engine, address indexed teller, bool listed);
-    /// @notice A revoked engine is still on `teller`'s list, or the list could not be read. {redelist}
-    ///         tries again.
+    /// @notice A revoked engine is still on `teller`'s list. {redelist} tries again.
     event EngineDelistingDeferred(address indexed engine, address indexed teller);
     /// @notice A revoked engine was delisted and still holds the engine role, which the RolesAuthority
     ///         did not let this contract clear. Its owner clears it.
@@ -223,10 +224,9 @@ contract VedaRoleGranter is IVedaStackAuthorizer, IAuthority {
     /// @dev Only a named factory, which asks only for engines it built. Authorizing reverts unless the
     ///      role is held and, where the engine is listed, the Teller reports it listed. Revoking
     ///      clears the role and delists the engine wherever this contract can find it listed: each
-    ///      step runs whether or not another fails, a Teller that does not take the change is named
-    ///      by `EngineDelistingDeferred`, and the engine is recorded so that nothing here lists it
-    ///      again. Revoking reverts only when the role could not be cleared and there was no listing
-    ///      to remove.
+    ///      step runs whether or not another fails, a Teller that still lists the engine is named by
+    ///      `EngineDelistingDeferred`, and the engine is recorded so that nothing here lists it again.
+    ///      Revoking reverts only when the role could not be cleared and no listing was found.
     /// @custom:ensures isFactory[msg.sender]
     function setEngineAuthorized(address engine, bool authorized) external onlyFactory {
         if (!authorized) {
@@ -255,8 +255,9 @@ contract VedaRoleGranter is IVedaStackAuthorizer, IAuthority {
     // ------------------------------------------------------------------
 
     /// @notice Lists engines that hold the engine role on the Teller published now.
-    /// @dev Open to anyone while {tellerAllowlist} is set, since it lists only accounts a named factory
-    ///      or the RolesAuthority's owner already gave the engine role. It is how the vault's engines
+    /// @dev Open to anyone while {tellerAllowlist} is set and this contract is the RolesAuthority's
+    ///      authority, since it lists only accounts a named factory or the RolesAuthority's owner
+    ///      already gave the engine role. It is how the vault's engines
     ///      reach a newly published Teller before their owners activate it, and how engines authorized
     ///      before the flag was set reach the list. Skipped, so that one of them does not fail a batch:
     ///      an account without the role or without code, an engine revoked through its factory, and
@@ -265,6 +266,9 @@ contract VedaRoleGranter is IVedaStackAuthorizer, IAuthority {
     /// @return carried How many engines were listed.
     function relist(address[] calldata engines) external returns (uint256 carried) {
         if (!tellerAllowlist) revert TellerAllowlistOff();
+        // The engine role says who is an engine only while the owner and this contract are the only
+        // writers of the role table the BoringVault obeys.
+        _requireSoleRoleWriter();
         address teller = address(registry.teller());
         address[] memory accounts = new address[](engines.length);
         for (uint256 i = 0; i < engines.length; i++) {
@@ -296,7 +300,9 @@ contract VedaRoleGranter is IVedaStackAuthorizer, IAuthority {
     /// @return removed How many engines are now off both lists.
     function redelist(address[] calldata engines) external returns (uint256 removed) {
         for (uint256 i = 0; i < engines.length; i++) {
-            if (listedOn[engines[i]] == DELISTED && _delist(engines[i], DELISTED)) removed++;
+            if (listedOn[engines[i]] != DELISTED) continue;
+            (bool applied,) = _delist(engines[i], DELISTED);
+            if (applied) removed++;
         }
     }
 
@@ -383,26 +389,33 @@ contract VedaRoleGranter is IVedaStackAuthorizer, IAuthority {
 
     /// @dev Clears the engine role and removes the engine's listings, each whether or not the other
     ///      works: a RolesAuthority that no longer admits this contract must not keep an engine on a
-    ///      Teller's list, and a Teller that cannot be written must not keep the role in place. An
-    ///      engine has listings to remove when this contract listed it, or when it holds the engine
-    ///      role while the flag is set, which covers an engine the owner listed directly on a Teller
-    ///      published after the engine was authorized. An account that never held the engine role and
-    ///      was never listed here, such as the stock solver, cannot be delisted through this.
+    ///      Teller's list, and a Teller that cannot be written must not keep the role in place. It
+    ///      looks for listings whenever this contract listed the engine or the engine holds the engine
+    ///      role, whatever the flag says now, which covers an engine someone else listed: the owner, on
+    ///      a Teller published after the engine was authorized, or whoever keeps the list where the
+    ///      flag is clear. Such an engine is recorded as revoked, so that nothing here lists it and
+    ///      {redelist} takes it off a Teller it reaches later. An account that never held the engine
+    ///      role and was never listed here, such as the stock solver, cannot be delisted through this.
     function _revokeEngine(address engine) private {
         address last = listedOn[engine];
-        bool delist = last != address(0) || (tellerAllowlist && rolesAuthority.doesUserHaveRole(engine, engineRole));
-        // Recorded first, so that nothing here lists the engine again whatever follows.
-        if (delist) listedOn[engine] = DELISTED;
+        bool known = last != address(0) || rolesAuthority.doesUserHaveRole(engine, engineRole);
 
         try rolesAuthority.setUserRole(engine, engineRole, false) { } catch { }
-        if (rolesAuthority.doesUserHaveRole(engine, engineRole)) {
-            // With no listing to remove either, nothing was revoked.
-            if (!delist) revert RoleUpdateFailed(engine, engineRole, false);
-            emit EngineRoleRevocationDeferred(engine);
-        } else {
-            emit EarnRoleUpdated(engine, engineRole, false);
+        bool roleCleared = !rolesAuthority.doesUserHaveRole(engine, engineRole);
+
+        bool found;
+        if (known) {
+            // Recorded before any Teller is called, so that nothing here lists the engine again.
+            listedOn[engine] = DELISTED;
+            (, found) = _delist(engine, last);
         }
-        if (delist) _delist(engine, last);
+        if (roleCleared) {
+            emit EarnRoleUpdated(engine, engineRole, false);
+        } else {
+            // With no listing to remove either, nothing was revoked.
+            if (!found) revert RoleUpdateFailed(engine, engineRole, false);
+            emit EngineRoleRevocationDeferred(engine);
+        }
     }
 
     /// @dev Lists `engine`, which holds the engine role, on the published Teller.
@@ -421,22 +434,30 @@ contract VedaRoleGranter is IVedaStackAuthorizer, IAuthority {
     ///      then; and `last`, where this contract listed it most recently. An engine can activate only
     ///      the published Teller, so a listing left on any other Teller is one it cannot use.
     /// @return applied Whether none of those lists holds the engine now.
-    function _delist(address engine, address last) private returns (bool applied) {
+    /// @return found Whether any of them held it, or `last` could not be read.
+    function _delist(address engine, address last) private returns (bool applied, bool found) {
         address published = address(registry.teller());
         (, address current) = VedaTellerAllowlist.tryTeller(engine);
-        applied = _delistOn(published, engine);
-        if (current != address(0) && current != published) applied = _delistOn(current, engine) && applied;
+        (applied, found) = _delistOn(published, engine, last);
+        if (current != address(0) && current != published) {
+            (bool currentApplied, bool currentFound) = _delistOn(current, engine, last);
+            (applied, found) = (applied && currentApplied, found || currentFound);
+        }
         if (last != address(0) && last != DELISTED && last != published && last != current) {
-            applied = _delistOn(last, engine) && applied;
+            (bool lastApplied, bool lastFound) = _delistOn(last, engine, last);
+            (applied, found) = (applied && lastApplied, found || lastFound);
         }
     }
 
     /// @dev `applied` says the Teller's list does not hold the engine, not that the Teller refuses it:
-    ///      an unenforced list refuses no one. A Teller that cannot be written or read is reported
-    ///      and never stops the revocation.
-    function _delistOn(address teller, address engine) private returns (bool applied) {
+    ///      an unenforced list refuses no one. A Teller that reports the engine listed and cannot be
+    ///      written is named by `EngineDelistingDeferred` and never stops the revocation. A Teller
+    ///      that does not answer `allowedAccounts` keeps no list this contract can read, and is passed
+    ///      over unless it is `last`, where this contract did read the engine's listing once.
+    function _delistOn(address teller, address engine, address last) private returns (bool applied, bool found) {
         (bool supported, bool listed) = VedaTellerAllowlist.tryAllowedAccounts(teller, engine);
-        if (supported && !listed) return true;
+        if (supported ? !listed : teller != last) return (true, false);
+        found = true;
         if (teller.code.length != 0) {
             try ITellerAllowlist(teller).setAllowedAccounts(_one(engine), false) {
                 (supported, listed) = VedaTellerAllowlist.tryAllowedAccounts(teller, engine);
@@ -449,16 +470,19 @@ contract VedaRoleGranter is IVedaStackAuthorizer, IAuthority {
 
     /// @dev What must hold before `role` is handed out.
     function _requireGrantable(uint8 role) private view {
-        // This contract is the only path to the role table besides the owner...
-        address currentAuthority = IAuth(address(rolesAuthority)).authority();
-        if (currentAuthority != address(this)) revert NotRolesAuthorityAuthority(currentAuthority);
-        // ...there is an owner who can still cut it off...
-        if (IAuth(address(rolesAuthority)).owner() == address(0)) revert RolesAuthorityHasNoOwner();
-        // ...and the role table inspected below is the one the BoringVault obeys.
-        address vaultAuthority = IAuth(vault).authority();
-        if (vaultAuthority != address(rolesAuthority)) revert VaultAuthorityMismatch(vaultAuthority);
+        _requireSoleRoleWriter();
         (address target, bytes4 functionSig) = _protectedCapability(role);
         if (target != address(0)) revert RoleReachesProtectedFunction(role, target, functionSig);
+    }
+
+    /// @dev This contract is the only path to the role table besides the owner, there is an owner who
+    ///      can still cut it off, and that role table is the one the BoringVault obeys.
+    function _requireSoleRoleWriter() private view {
+        address currentAuthority = IAuth(address(rolesAuthority)).authority();
+        if (currentAuthority != address(this)) revert NotRolesAuthorityAuthority(currentAuthority);
+        if (IAuth(address(rolesAuthority)).owner() == address(0)) revert RolesAuthorityHasNoOwner();
+        address vaultAuthority = IAuth(vault).authority();
+        if (vaultAuthority != address(rolesAuthority)) revert VaultAuthorityMismatch(vaultAuthority);
     }
 
     /// @dev The first custody or role-administration function `role` can call, or zero when it can call

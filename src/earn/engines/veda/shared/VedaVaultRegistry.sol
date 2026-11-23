@@ -175,8 +175,9 @@ contract VedaVaultRegistry is IVedaVaultRegistry {
     }
 
     /// @dev Where the Teller keeps an account allowlist: a Queue that checks one must check this
-    ///      Teller's, or it would settle against a list the vault's engines are not on, and the stock
-    ///      solver must be on it, because the solver redeems every settled request through the Teller.
+    ///      Teller's, or it would settle against a list the vault's engines are not on, and the list
+    ///      must admit the stock solver, because the solver redeems every settled request through the
+    ///      Teller. A list that is not enforced admits every account.
     ///      Modules that expose neither reading are taken to have no allowlist.
     function _requireAllowlistWiring(address newTeller, address newQueue, address newSolver) private view {
         (bool queueChecks, address queueTeller) = VedaTellerAllowlist.tryTeller(newQueue);
