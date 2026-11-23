@@ -22,6 +22,8 @@ interface IVedaVaultRegistry {
     function version() external view returns (uint64);
     /// @notice Whether `account` administers the BoringVault: its owner, or the owner of its authority.
     function isVaultAdmin(address account) external view returns (bool);
+    /// @notice Whether the vault's pausers have stopped `engine`'s deposits. Its exits are unaffected.
+    function depositsHalted(address engine) external view returns (bool);
 }
 
 /// @notice The seam through which a {VedaStackFactory} authorizes the engines and forwarding solvers it
@@ -51,6 +53,14 @@ interface IVedaTellerLister {
     ///         delisting records the engine as delisted either way and reports whether the Teller
     ///         took the change.
     function setEngineListed(address engine, bool listed) external returns (bool applied);
+}
+
+/// @notice The owner a {VedaStackFactory} gives its forwarding solvers when that owner is a contract that
+///         approves the vault's solvers on each one. `VedaForwarderSteward` implements it.
+interface IVedaForwarderSteward {
+    /// @notice Approves every solver the steward lists on `forwarder`, which the steward must own.
+    /// @return approved How many listed solvers `forwarder` now has approved.
+    function seed(address forwarder) external returns (uint256 approved);
 }
 
 /// @notice The wiring a `VedaStackFactory` reports, which an authorizer or a lister checks before

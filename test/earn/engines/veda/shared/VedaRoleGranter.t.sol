@@ -442,7 +442,7 @@ contract VedaRoleStackHandler is Test {
 
     function createStack(uint256 actorSeed, address owner, address policyAdmin) external {
         vm.prank(_actor(actorSeed));
-        try factory.createStack(_engineParams(), _coreParams(owner), policyAdmin) returns (
+        try factory.createStack(_nextJob(), _engineParams(), _coreParams(owner), policyAdmin) returns (
             address engine, address, address
         ) {
             _track(engine);
@@ -451,7 +451,7 @@ contract VedaRoleStackHandler is Test {
 
     function deployEngine(uint256 actorSeed) external {
         vm.prank(_actor(actorSeed));
-        try factory.deployEngine(_engineParams()) returns (address engine) {
+        try factory.deployEngine(_nextJob(), _engineParams()) returns (address engine) {
             engines.push(engine);
         } catch { }
     }
@@ -538,6 +538,10 @@ contract VedaRoleStackHandler is Test {
 
     function _actor(uint256 seed) private view returns (address) {
         return actors[seed % actors.length];
+    }
+
+    function _nextJob() private returns (bytes32) {
+        return keccak256(abi.encode("handler job", _nonce++));
     }
 
     function _engineParams() private pure returns (VedaStackFactory.EngineParams memory) {

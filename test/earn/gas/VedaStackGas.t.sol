@@ -6,6 +6,7 @@ pragma solidity ^0.8.36;
 //   FOUNDRY_PROFILE=spend forge test --match-path test/earn/gas/VedaStackGas.t.sol --no-match-path none -vv
 // forge-lint: disable-start(multi-contract-file)
 import { console2 } from "forge-std/Test.sol";
+import { VedaForwarderSteward } from "../../../src/earn/engines/veda/shared/VedaForwarderSteward.sol";
 import { AuthedQueue, AuthedSolver, AuthedTeller } from "../helpers/VedaAuthMocks.sol";
 import {
     VedaAllowlistStackTestBase,
@@ -21,7 +22,7 @@ abstract contract VedaStackGasAudit is VedaStackTestBase {
         vm.pauseGasMetering();
         vm.prank(operator);
         uint256 gasBefore = _startMeasure();
-        factory.createStack(_engineParams(), _coreParams(STACK), address(0));
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK), address(0));
         _stopMeasure("factory.createStack.queued", gasBefore);
         assertEq(factory.engineCount(), 1);
     }
@@ -31,7 +32,7 @@ abstract contract VedaStackGasAudit is VedaStackTestBase {
         _rotate(teller, AuthedQueue(address(0)), AuthedSolver(address(0)));
         vm.prank(operator);
         uint256 gasBefore = _startMeasure();
-        factory.createStack(_engineParams(), _coreParams(STACK), address(0));
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK), address(0));
         _stopMeasure("factory.createStack.immediate", gasBefore);
         assertEq(factory.engineCount(), 1);
     }
@@ -40,7 +41,7 @@ abstract contract VedaStackGasAudit is VedaStackTestBase {
         vm.pauseGasMetering();
         vm.prank(operator);
         uint256 gasBefore = _startMeasure();
-        factory.deployEngine(_engineParams());
+        factory.deployEngine(_nextJob(), _engineParams());
         _stopMeasure("factory.deployEngine", gasBefore);
         assertEq(factory.engineCount(), 1);
     }
@@ -48,7 +49,7 @@ abstract contract VedaStackGasAudit is VedaStackTestBase {
     function testGasFinalizeStackWithQueue() public {
         vm.pauseGasMetering();
         vm.prank(operator);
-        address engine = factory.deployEngine(_engineParams());
+        address engine = factory.deployEngine(_nextJob(), _engineParams());
         vm.prank(operator);
         uint256 gasBefore = _startMeasure();
         factory.finalizeStack(engine, _coreParams(STACK), address(0));
@@ -60,7 +61,7 @@ abstract contract VedaStackGasAudit is VedaStackTestBase {
         vm.pauseGasMetering();
         _rotate(teller, AuthedQueue(address(0)), AuthedSolver(address(0)));
         vm.prank(operator);
-        (address engine,,) = factory.createStack(_engineParams(), _coreParams(STACK), address(0));
+        (address engine,,) = factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK), address(0));
         _rotate(teller, queue, solver);
         vm.prank(operator);
         uint256 gasBefore = _startMeasure();
@@ -93,9 +94,14 @@ contract VedaOverlayStackGasAudit is VedaOverlayStackTestBase, VedaStackGasAudit
     }
 }
 
-/// @dev The role granter for the Queue and the stock solver, plus a Teller lister for the engine.
+/// @dev The role granter for the Queue and the stock solver, a Teller lister for the engine, and a
+///      steward that approves one solver on each forwarding solver: everything a build can write.
 contract VedaAllowlistStackGasAudit is VedaAllowlistStackTestBase, VedaStackGasAudit {
     function setUp() public override(VedaStackTestBase) {
+        address[] memory solvers = new address[](1);
+        solvers[0] = solverBot;
+        forwarderOwner = address(new VedaForwarderSteward(makeAddr("solver safe"), solvers));
+        forwarderOwnerIsSteward = true;
         super.setUp();
     }
 

@@ -31,6 +31,15 @@ import { VedaTellerAllowlist } from "./VedaTellerAllowlist.sol";
 ///      their places on the new Teller's list, or that the caller chose tight bounds; those stay with
 ///      the review of the publication. Bounds as wide as `1` and the maximum waive the rate check, and
 ///      a rate that jumps inside the bounds is priced by every stack at once, fees included.
+///
+///      DEPOSIT HALT. Every engine also reads here whether its own deposits are halted. The vault's
+///      pausers set that for one engine and only the administrator clears it. It is the vault's side of
+///      a stack's deposit pause, for a stack whose owner will not or cannot pause it: the engine's
+///      deposits stop and every exit keeps working. It binds because an engine's code is fixed; it
+///      does nothing for an account that reaches the Teller without an engine. Where the vault lets
+///      anyone call the Teller's bulk deposit, anyone can still mint shares straight to a halted
+///      engine and have its EarnVault absorb them, so there the halt stops the stack's own deposit
+///      path and nothing more: only a Teller that restricts who may call bulk deposit makes it a stop.
 contract VedaVaultRegistry is IVedaVaultRegistry {
     IBoringVault public immutable vault;
     address public immutable baseAsset;
@@ -41,6 +50,10 @@ contract VedaVaultRegistry is IVedaVaultRegistry {
     IAccountant public accountant;
     IBoringSolver public solver;
 
+    /// @notice Engines whose deposits the vault's pausers have stopped. Their exits are unaffected.
+    mapping(address engine => bool halted) public depositsHalted;
+
+    event DepositsHaltChanged(address indexed engine, bool halted, address indexed by);
     event VedaVaultPeripheryPublished(
         uint64 indexed version,
         address indexed teller,
@@ -56,6 +69,7 @@ contract VedaVaultRegistry is IVedaVaultRegistry {
     error InvalidVedaPeripheryWiring(address component, address expected, address actual);
     error InvalidVedaRateBounds(uint256 minRate, uint256 maxRate);
     error SolverNotListedOnTeller(address solver, address teller);
+    error NotPauser(address caller);
     error NotVaultAdmin(address caller);
     error QueueSolverMismatch(address queue, address solver);
     error QueueTellerMismatch(address queue, address expected, address actual);
@@ -104,6 +118,30 @@ contract VedaVaultRegistry is IVedaVaultRegistry {
         emit VedaVaultPeripheryPublished(
             newVersion, address(newTeller), address(newQueue), address(newAccountant), address(newSolver), validatedRate
         );
+    }
+
+    /// @notice Stops `engine`'s deposits. Its immediate and queued exits, cancellations and
+    ///         settlements keep working.
+    /// @dev The vault's administrator, or an account the BoringVault's authority lets call this
+    ///      function here. Halting only reduces what an engine can do, and it is not undone by the
+    ///      engine's owner. Any address may be named; only a {VedaLockstepEngine} on this registry
+    ///      reads its own entry.
+    function haltDeposits(address engine) external {
+        if (!isVaultAdmin(msg.sender)) {
+            (bool hasAuthority, address authority) = _tryReadAddress(address(vault), IAuth.authority.selector);
+            if (
+                !hasAuthority || authority.code.length == 0
+                    || !IAuthority(authority).canCall(msg.sender, address(this), msg.sig)
+            ) revert NotPauser(msg.sender);
+        }
+        depositsHalted[engine] = true;
+        emit DepositsHaltChanged(engine, true, msg.sender);
+    }
+
+    /// @notice Lets `engine` take deposits again.
+    function resumeDeposits(address engine) external onlyVaultAdmin {
+        depositsHalted[engine] = false;
+        emit DepositsHaltChanged(engine, false, msg.sender);
     }
 
     /// @notice Whether `account` administers the BoringVault: its owner, or the owner of its authority.

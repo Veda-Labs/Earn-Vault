@@ -3,6 +3,7 @@ pragma solidity ^0.8.36;
 
 import { IEarnVault } from "../../../../interfaces/earn/IEarnVault.sol";
 import {
+    IVedaForwarderSteward,
     IVedaStackAuthorizer,
     IVedaTellerLister,
     IVedaVaultRegistry
@@ -85,7 +86,9 @@ contract VedaStackFactory {
         /// Deployed by this factory and owned by it; bound to nothing and authorized for nothing.
         Pending,
         Active,
-        Revoked
+        Revoked,
+        /// Deployed and never bound, then set aside for good: it can no longer be finalized.
+        Discarded
     }
 
     enum ForwarderStatus {
@@ -106,6 +109,7 @@ contract VedaStackFactory {
         VedaForwardingSolverDeployer forwarderDeployer;
         bytes32 forwarderDeployerCodeHash;
         address forwarderOwner;
+        bool forwarderOwnerIsSteward;
         address forwarderTreasury;
         address operator;
     }
@@ -152,6 +156,10 @@ contract VedaStackFactory {
     bytes32 public immutable forwarderDeployerCodeHash;
     /// @notice Owner of every forwarding solver built here: it allowlists the solvers that may trigger.
     address public immutable forwarderOwner;
+    /// @notice Whether {forwarderOwner} is a {VedaForwarderSteward}, which approves the vault's solvers
+    ///         on each forwarding solver as it is built. Otherwise a new forwarding solver settles
+    ///         nothing until its owner approves a solver on it.
+    bool public immutable forwarderOwnerIsSteward;
     /// @notice Where every forwarding solver built here sends rescued surplus.
     address public immutable forwarderTreasury;
 
@@ -160,13 +168,17 @@ contract VedaStackFactory {
     /// @notice While set, no engine, stack or forwarding solver is built or authorized.
     bool public registrationsPaused;
 
+    /// @notice The engine built for each job id; zero when no build under that id has landed. A job id
+    ///         builds one engine, so a build that is sent twice lands once.
+    mapping(bytes32 jobId => address engine) public engineOf;
     mapping(address engine => StackRecord) private _stacks;
     mapping(address forwarder => ForwarderRecord) private _forwarders;
     address[] private _engines;
 
     bool private transient _entered;
 
-    event EngineDeployed(address indexed engine, address indexed creator);
+    event EngineDeployed(address indexed engine, address indexed creator, bytes32 indexed jobId);
+    event EngineDiscarded(address indexed engine, address indexed by);
     event StackCreated(
         address indexed engine,
         address indexed earnVault,
@@ -189,17 +201,20 @@ contract VedaStackFactory {
     error AmbiguousTransferPolicy(uint64 transferPolicyId, address newPolicyAdmin);
     error AuthorizerNotBound();
     error CodeHashMismatch(address account, bytes32 expected, bytes32 actual);
+    error EmptyJobId();
     error EngineMustBeUnset(address engine);
     error EngineNotActive(address engine);
     error EngineNotPending(address engine);
     error EngineNotRevoked(address engine);
     error FactoryCannotBeOwner();
     error ForwarderNotActive(address forwarder);
+    error ForwarderNotSeeded(address forwarder);
     error ForwarderNotRevoked(address forwarder);
     error InvalidEngineDeployment(address engine);
     error InvalidFactoryWiring(address account);
     error InvalidForwarderDeployment(address forwarder);
     error InvalidTransferPolicyAdmin(address admin);
+    error JobAlreadyBuilt(bytes32 jobId, address engine);
     error NotAuthorizedOnVeda(address account, address target, bytes4 functionSig);
     error NotListedOnTeller(address engine, address teller);
     error NotOperator(address caller);
@@ -253,6 +268,13 @@ contract VedaStackFactory {
         // Either may be absent: a vault can gate its engines by role, by the Teller's list, or by both.
         if (address(config.authorizer) != address(0)) _requireCode(address(config.authorizer));
         if (address(config.tellerLister) != address(0)) _requireCode(address(config.tellerLister));
+        if (config.forwarderOwnerIsSteward) {
+            _requireCode(config.forwarderOwner);
+            // A steward cannot move tokens it holds, so surplus rescued to it would be stranded.
+            if (config.forwarderTreasury == config.forwarderOwner) {
+                revert InvalidFactoryWiring(config.forwarderTreasury);
+            }
+        }
         // Each pinned contract is named by address and by the code hash its deployer states, which is
         // what a reviewer compares with the release. The hashes cannot be wrong for these addresses.
         _requireCodeHash(address(config.earnFactory), config.earnFactoryCodeHash);
@@ -269,6 +291,7 @@ contract VedaStackFactory {
         forwarderDeployer = config.forwarderDeployer;
         forwarderDeployerCodeHash = config.forwarderDeployerCodeHash;
         forwarderOwner = config.forwarderOwner;
+        forwarderOwnerIsSteward = config.forwarderOwnerIsSteward;
         forwarderTreasury = config.forwarderTreasury;
         operator = config.operator;
         emit OperatorChanged(address(0), config.operator);
@@ -279,6 +302,11 @@ contract VedaStackFactory {
     // ------------------------------------------------------------------
 
     /// @notice Builds a whole stack in one call and hands it to `core.owner`.
+    /// @param jobId The caller's own nonzero id for this build. It builds one engine: a second call
+    ///        under the same id reverts, and {engineOf} says which engine the first one built. The id
+    ///        commits to no settings, so a caller told its job was already built checks that engine's
+    ///        settings and stack owner before adopting it. It is separate from `core.deploymentId`,
+    ///        which may have to change when a finalize is retried, and from any other factory's ids.
     /// @param engineParams The engine's name, symbol and rate age bound; EarnShare takes its name from them.
     /// @param core The canonical `EarnFactory` parameters. `core.engine` must be zero: this factory
     ///        supplies the engine. `core.owner` becomes the EarnVault's operator and the engine's owner.
@@ -286,23 +314,26 @@ contract VedaStackFactory {
     ///        restriction). Nonzero to create a new TIP-403 whitelist administered by that address and
     ///        attach it; `core.transferPolicyId` must then be zero.
     function createStack(
+        bytes32 jobId,
         EngineParams calldata engineParams,
         EarnFactory.DeployParams calldata core,
         address newTransferPolicyAdmin
     ) external onlyOperator nonReentrant returns (address engine, address earnVault, address earnShare) {
-        engine = _deployEngine(engineParams);
+        engine = _deployEngine(jobId, engineParams);
         (earnVault, earnShare) = _finalizeStack(engine, core, newTransferPolicyAdmin);
     }
 
     /// @notice First half of a stack built in two transactions: deploys the engine, owned by this
     ///         factory, bound to nothing and authorized for nothing until {finalizeStack}.
-    function deployEngine(EngineParams calldata engineParams)
+    /// @dev `jobId` as in {createStack}. {finalizeStack} is safe to send twice by itself: it accepts
+    ///      a pending engine once.
+    function deployEngine(bytes32 jobId, EngineParams calldata engineParams)
         external
         onlyOperator
         nonReentrant
         returns (address engine)
     {
-        engine = _deployEngine(engineParams);
+        engine = _deployEngine(jobId, engineParams);
     }
 
     /// @notice Second half: builds the rest of the stack around an engine from {deployEngine}.
@@ -396,6 +427,16 @@ contract VedaStackFactory {
         emit RegistrationsPauseChanged(true, msg.sender);
     }
 
+    /// @notice Sets a pending engine aside for good, so that it can never be finalized: for an engine
+    ///         deployed by an operator key that is no longer trusted. It is bound to nothing and
+    ///         authorized for nothing, and its job id stays used.
+    function discardEngine(address engine) external onlyPauser nonReentrant {
+        StackRecord storage record = _stacks[engine];
+        if (record.status != EngineStatus.Pending) revert EngineNotPending(engine);
+        record.status = EngineStatus.Discarded;
+        emit EngineDiscarded(engine, msg.sender);
+    }
+
     // ------------------------------------------------------------------
     // Vault administrator: restore
     // ------------------------------------------------------------------
@@ -464,7 +505,8 @@ contract VedaStackFactory {
     /// @notice Whether `engine` is an active stack of this factory that the vault's published modules
     ///         would serve right now: allowed to call them, and admitted by the Teller's list.
     /// @dev Read live, unlike a stack's status, which only says what this factory last did. A Teller
-    ///      whose list is not enforced, or cannot be read, admits every account. It does not cover a
+    ///      whose list is not enforced, or cannot be read, admits every account. It does not cover the
+    ///      registry's deposit halt, which is read from the registry, a
     ///      paused Teller, a deposit cap, the stack's own EarnVault controls, or whether the Queue
     ///      applies the Teller's list.
     function isEngineReady(address engine) external view returns (bool) {
@@ -473,11 +515,50 @@ contract VedaStackFactory {
         return target == address(0) && _isListed(engine, address(registry.teller()));
     }
 
+    /// @notice Whether the wiring and permissions a queued exit needs are in place for `forwarder` and
+    ///         `solver`: it is an active forwarding solver of this factory, fixed to the Queue, stock
+    ///         solver and Teller published now, admitted by its engine, allowed on the stock solver,
+    ///         and has `solver` approved; and a Teller that keeps a list admits the stock solver, and
+    ///         the engine where the Queue applies that list.
+    /// @dev Read live. The queued path is a backup that may go unused for a long time, so this is how
+    ///      to learn that it is miswired before it is needed. True does not mean a settlement would
+    ///      succeed: it does not cover the stock solver's own permissions on the Queue and the Teller,
+    ///      a pause, liquidity or a deficit nobody funds, the base asset's transfer policy, or a
+    ///      request's maturity and deadline. False does not mean broken for a forwarder fixed to a
+    ///      replaced Queue that still has open requests.
+    function isForwarderReady(address forwarder, address solver) external view returns (bool) {
+        ForwarderRecord memory record = _forwarders[forwarder];
+        if (record.status != ForwarderStatus.Active) return false;
+        VedaForwardingSolver built = VedaForwardingSolver(forwarder);
+        address queue = address(registry.queue());
+        address stockSolver = address(registry.solver());
+        address teller = address(registry.teller());
+        if (
+            queue == address(0) || address(built.queue()) != queue || address(built.boringSolver()) != stockSolver
+                || built.teller() != teller
+        ) return false;
+        if (!VedaLockstepEngine(record.engine).authorizedForwarder(forwarder) || !built.isAuthorizedSolver(solver)) {
+            return false;
+        }
+        if (!_canCall(forwarder, stockSolver, IBoringSolver.boringRedeemSolve.selector)) return false;
+        (bool checked, bool allowed) = VedaTellerAllowlist.tryIsWithdrawAllowed(teller, stockSolver);
+        if (checked && !allowed) return false;
+        (bool queueChecks, address queueTeller) = VedaTellerAllowlist.tryQueueTeller(queue);
+        if (queueChecks && queueTeller != address(0)) {
+            (checked, allowed) = VedaTellerAllowlist.tryIsWithdrawAllowed(queueTeller, record.engine);
+            if (checked && !allowed) return false;
+        }
+        return true;
+    }
+
     // ------------------------------------------------------------------
     // Internal
     // ------------------------------------------------------------------
 
-    function _deployEngine(EngineParams calldata engineParams) private returns (address engine) {
+    function _deployEngine(bytes32 jobId, EngineParams calldata engineParams) private returns (address engine) {
+        if (jobId == bytes32(0)) revert EmptyJobId();
+        address built = engineOf[jobId];
+        if (built != address(0)) revert JobAlreadyBuilt(jobId, built);
         engine = engineDeployer.deploy(
             registry, address(this), engineParams.maxRateAge, engineParams.name, engineParams.symbol
         );
@@ -493,8 +574,9 @@ contract VedaStackFactory {
         StackRecord storage record = _stacks[engine];
         record.status = EngineStatus.Pending;
         record.creator = msg.sender;
+        engineOf[jobId] = engine;
         _engines.push(engine);
-        emit EngineDeployed(engine, msg.sender);
+        emit EngineDeployed(engine, msg.sender, jobId);
     }
 
     function _finalizeStack(address engine, EarnFactory.DeployParams calldata core, address newTransferPolicyAdmin)
@@ -567,6 +649,11 @@ contract VedaStackFactory {
                 || built.owner() != forwarderOwner || built.treasury() != forwarderTreasury
         ) revert InvalidForwarderDeployment(forwarder);
         _forwarders[forwarder] = ForwarderRecord({ engine: engine, status: ForwarderStatus.Active });
+        // A steward approves the vault's solvers now, so the forwarder can settle from its first
+        // request. A forwarder no listed solver could trigger is not built.
+        if (forwarderOwnerIsSteward && IVedaForwarderSteward(forwarderOwner).seed(forwarder) == 0) {
+            revert ForwarderNotSeeded(forwarder);
+        }
         emit ForwarderDeployed(forwarder, engine, address(queue), address(solver));
     }
 

@@ -109,11 +109,15 @@ contract ReentrantOperator {
     }
 
     function run() external {
-        factory.deployEngine(VedaStackFactory.EngineParams({ name: "V", symbol: "v", maxRateAge: 1 days }));
+        factory.deployEngine(
+            keccak256("outer"), VedaStackFactory.EngineParams({ name: "V", symbol: "v", maxRateAge: 1 days })
+        );
     }
 
     function deploy(IVedaVaultRegistry, address, uint64, string calldata, string calldata) external returns (address) {
-        factory.deployEngine(VedaStackFactory.EngineParams({ name: "V", symbol: "v", maxRateAge: 1 days }));
+        factory.deployEngine(
+            keccak256("inner"), VedaStackFactory.EngineParams({ name: "V", symbol: "v", maxRateAge: 1 days })
+        );
         return address(0);
     }
 }
@@ -236,7 +240,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
 
     function testTwoTransactionBuildEndsInTheSameStack() public {
         vm.prank(operator);
-        address engine = factory.deployEngine(_engineParams());
+        address engine = factory.deployEngine(_nextJob(), _engineParams());
 
         // Between the two halves: owned by the factory, bound to nothing, authorized for nothing.
         VedaStackFactory.StackRecord memory pending = factory.stack(engine);
@@ -281,7 +285,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
 
     function testRevertedFinalizeLeavesTheEnginePendingUnboundAndUnauthorized() public {
         vm.prank(operator);
-        address engine = factory.deployEngine(_engineParams());
+        address engine = factory.deployEngine(_nextJob(), _engineParams());
 
         EarnFactory.DeployParams memory bad = _coreParams(bytes32(0));
         vm.prank(operator);
@@ -303,25 +307,25 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         params.engine = makeAddr("some engine");
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineMustBeUnset.selector, params.engine));
-        factory.createStack(_engineParams(), params, address(0));
+        factory.createStack(_nextJob(), _engineParams(), params, address(0));
 
         params = _coreParams(STACK_A);
         params.owner = address(factory);
         vm.prank(operator);
         vm.expectRevert(VedaStackFactory.FactoryCannotBeOwner.selector);
-        factory.createStack(_engineParams(), params, address(0));
+        factory.createStack(_nextJob(), _engineParams(), params, address(0));
 
         params = _coreParams(STACK_A);
         params.owner = address(0);
         vm.prank(operator);
         vm.expectRevert(EarnFactory.ZeroAddress.selector);
-        factory.createStack(_engineParams(), params, address(0));
+        factory.createStack(_nextJob(), _engineParams(), params, address(0));
         assertEq(factory.engineCount(), 0);
     }
 
     function testOnlyTheOperatorBuilds() public {
         vm.prank(operator);
-        address pendingEngine = factory.deployEngine(_engineParams());
+        address pendingEngine = factory.deployEngine(_nextJob(), _engineParams());
         (VedaLockstepEngine engine,,) = _createStack(STACK_A);
 
         address[4] memory callers = [stranger, admin, pauser, stackOwner];
@@ -329,9 +333,9 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
             bytes memory notOperator = abi.encodeWithSelector(VedaStackFactory.NotOperator.selector, callers[i]);
             vm.startPrank(callers[i]);
             vm.expectRevert(notOperator);
-            factory.createStack(_engineParams(), _coreParams(STACK_B), address(0));
+            factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK_B), address(0));
             vm.expectRevert(notOperator);
-            factory.deployEngine(_engineParams());
+            factory.deployEngine(_nextJob(), _engineParams());
             vm.expectRevert(notOperator);
             factory.finalizeStack(pendingEngine, _coreParams(STACK_B), address(0));
             vm.expectRevert(notOperator);
@@ -360,6 +364,170 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         assertEq(address(engineB.teller()), address(newTeller));
     }
 
+    function testAJobIdBuildsOneEngineHoweverOftenItIsSent() public {
+        bytes32 job = keccak256("job-one");
+        vm.prank(operator);
+        (address engine,,) = factory.createStack(job, _engineParams(), _coreParams(STACK_A), address(0));
+        assertEq(factory.engineOf(job), engine);
+
+        // The same build sent again, or the same job with other settings, builds nothing.
+        bytes memory alreadyBuilt = abi.encodeWithSelector(VedaStackFactory.JobAlreadyBuilt.selector, job, engine);
+        vm.startPrank(operator);
+        vm.expectRevert(alreadyBuilt);
+        factory.createStack(job, _engineParams(), _coreParams(STACK_A), address(0));
+        vm.expectRevert(alreadyBuilt);
+        factory.createStack(job, _engineParams(), _coreParams(STACK_B), address(0));
+        vm.expectRevert(alreadyBuilt);
+        factory.deployEngine(job, _engineParams());
+        vm.expectRevert(VedaStackFactory.EmptyJobId.selector);
+        factory.createStack(bytes32(0), _engineParams(), _coreParams(STACK_B), address(0));
+        vm.expectRevert(VedaStackFactory.EmptyJobId.selector);
+        factory.deployEngine(bytes32(0), _engineParams());
+        vm.stopPrank();
+        assertEq(factory.engineCount(), 1);
+
+        // In two transactions the first half is the one a job id guards; the second already accepts
+        // an engine once.
+        bytes32 second = keccak256("job-two");
+        vm.startPrank(operator);
+        address pending = factory.deployEngine(second, _engineParams());
+        assertEq(factory.engineOf(second), pending);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.JobAlreadyBuilt.selector, second, pending));
+        factory.deployEngine(second, _engineParams());
+        factory.finalizeStack(pending, _coreParams(STACK_B), address(0));
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotPending.selector, pending));
+        factory.finalizeStack(pending, _coreParams(STACK_B), address(0));
+        vm.stopPrank();
+        assertEq(factory.engineCount(), 2);
+    }
+
+    function testPausersDiscardAPendingEngineSoItCanNeverBeFinalized() public {
+        bytes32 job = keccak256("job-one");
+        vm.prank(operator);
+        address pending = factory.deployEngine(job, _engineParams());
+        (VedaLockstepEngine active,,) = _createStack(STACK_A);
+
+        address[3] memory nonPausers = [stranger, operator, stackOwner];
+        for (uint256 i = 0; i < nonPausers.length; i++) {
+            vm.prank(nonPausers[i]);
+            vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.NotPauser.selector, nonPausers[i]));
+            factory.discardEngine(pending);
+        }
+        // Only an engine that was never bound can be discarded.
+        vm.startPrank(admin);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotPending.selector, address(active)));
+        factory.discardEngine(address(active));
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotPending.selector, stranger));
+        factory.discardEngine(stranger);
+        factory.discardEngine(pending);
+        vm.stopPrank();
+        assertEq(uint256(factory.stack(pending).status), uint256(VedaStackFactory.EngineStatus.Discarded));
+
+        // Nothing brings it back: not a finalize, not a reinstatement, not its job id.
+        vm.startPrank(operator);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotPending.selector, pending));
+        factory.finalizeStack(pending, _coreParams(STACK_B), address(0));
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.JobAlreadyBuilt.selector, job, pending));
+        factory.deployEngine(job, _engineParams());
+        vm.stopPrank();
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotRevoked.selector, pending));
+        factory.reinstateEngine(pending);
+        assertFalse(_canCall(pending, address(teller), ITeller.bulkDeposit.selector));
+        assertEq(VedaLockstepEngine(pending).earnVault(), address(0));
+    }
+
+    function testAJobWhoseBuildRevertedCanBeSentAgain() public {
+        bytes32 job = keccak256("job-one");
+        vm.prank(operator);
+        vm.expectRevert(EarnFactory.EmptyDeploymentId.selector);
+        factory.createStack(job, _engineParams(), _coreParams(bytes32(0)), address(0));
+        assertEq(factory.engineOf(job), address(0));
+
+        vm.prank(operator);
+        (address engine,,) = factory.createStack(job, _engineParams(), _coreParams(STACK_A), address(0));
+        assertEq(factory.engineOf(job), engine);
+    }
+
+    // ------------------------------------------------------------------
+    // The vault's own deposit halt
+    // ------------------------------------------------------------------
+
+    function testPausersHaltOneStacksDepositsAndEveryExitKeepsWorking() public {
+        (VedaLockstepEngine engineA, EarnVault vaultA, StackMockShareToken shareA) = _createStack(STACK_A);
+        (VedaLockstepEngine engineB, EarnVault vaultB,) = _createStack(STACK_B);
+        _deposit(vaultA, user, 100e6);
+        bytes32 queuedBefore = _requestRedeem(vaultA, shareA, user, 10e6);
+
+        address[3] memory nonPausers = [stranger, operator, stackOwner];
+        for (uint256 i = 0; i < nonPausers.length; i++) {
+            vm.prank(nonPausers[i]);
+            vm.expectRevert(abi.encodeWithSelector(VedaVaultRegistry.NotPauser.selector, nonPausers[i]));
+            registry.haltDeposits(address(engineA));
+        }
+        vm.prank(pauser);
+        registry.haltDeposits(address(engineA));
+        assertTrue(registry.depositsHalted(address(engineA)));
+        // The halt is the registry's to report; the Veda modules still serve the engine.
+        assertTrue(factory.isEngineReady(address(engineA)));
+
+        // Deposits into this stack stop, and its owner cannot bring them back.
+        asset.mint(user, 2e6);
+        vm.startPrank(user);
+        asset.approve(address(vaultA), 2e6);
+        vm.expectRevert(VedaLockstepEngine.DepositsHalted.selector);
+        vaultA.deposit(1e6, user, 1);
+        vm.stopPrank();
+        vm.startPrank(stackOwner);
+        vaultA.setDepositsPaused(false);
+        vm.expectRevert(abi.encodeWithSelector(VedaVaultRegistry.NotVaultAdmin.selector, stackOwner));
+        registry.resumeDeposits(address(engineA));
+        vm.stopPrank();
+        vm.prank(pauser);
+        vm.expectRevert(abi.encodeWithSelector(VedaVaultRegistry.NotVaultAdmin.selector, pauser));
+        registry.resumeDeposits(address(engineA));
+        vm.prank(user);
+        vm.expectRevert(VedaLockstepEngine.DepositsHalted.selector);
+        vaultA.deposit(1e6, user, 1);
+
+        // Nor can shares be minted straight to the engine: here only the vault's engines may call the
+        // Teller's bulk deposit, and this engine's own deposit is the halted one.
+        vm.startPrank(stackOwner);
+        vm.expectRevert(bytes("UNAUTHORIZED"));
+        teller.bulkDeposit(address(asset), 1e6, 0, address(engineA));
+        vm.stopPrank();
+
+        // Every exit keeps working: instant, a request already queued, a new request, a cancellation.
+        vm.startPrank(user);
+        shareA.approve(address(vaultA), 20e6);
+        assertEq(vaultA.redeem(20e6, receiver, 20e6), 20e6);
+        vm.stopPrank();
+        VedaForwardingSolver forwarder = VedaForwardingSolver(factory.stack(address(engineA)).forwarder);
+        assertEq(_solve(forwarder, queuedBefore), 1);
+        bytes32 queuedAfter = _requestRedeem(vaultA, shareA, user, 5e6);
+        bytes32 cancelled = _requestRedeem(vaultA, shareA, user, 5e6);
+        vm.prank(user);
+        vaultA.cancelRedeem(cancelled, 1);
+        assertEq(_solve(forwarder, queuedAfter), 1);
+        assertEq(asset.balanceOf(user), 2e6 + 10e6 + 5e6);
+
+        // Another stack on the vault is untouched.
+        assertEq(_deposit(vaultB, user, 3e6), 3e6);
+        assertFalse(registry.depositsHalted(address(engineB)));
+
+        // Only the administrator lets deposits back in.
+        vm.prank(admin);
+        registry.resumeDeposits(address(engineA));
+        assertFalse(registry.depositsHalted(address(engineA)));
+        vm.prank(user);
+        assertEq(vaultA.deposit(1e6, user, 1), 1e6);
+
+        // The administrator may halt too.
+        vm.prank(admin);
+        registry.haltDeposits(address(engineB));
+        assertTrue(registry.depositsHalted(address(engineB)));
+    }
+
     // ------------------------------------------------------------------
     // Fail closed
     // ------------------------------------------------------------------
@@ -374,7 +542,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
 
         vm.prank(operator);
         vm.expectPartialRevert(VedaStackFactory.NotAuthorizedOnVeda.selector);
-        factory.createStack(_engineParams(), _coreParams(STACK_A), address(0));
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK_A), address(0));
         assertEq(factory.engineCount(), 0);
     }
 
@@ -385,7 +553,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
 
         vm.prank(operator);
         vm.expectRevert(VedaStackFactory.AuthorizerNotBound.selector);
-        unnamed.createStack(_engineParams(), _coreParams(STACK_A), address(0));
+        unnamed.createStack(_nextJob(), _engineParams(), _coreParams(STACK_A), address(0));
     }
 
     function testAFactoryOnAnotherRegistryOfTheSameVaultCannotBeNamed() public {
@@ -411,7 +579,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
 
         vm.prank(operator);
         (address secondEngine, address secondVault,) =
-            second.createStack(_engineParams(), _coreParams(STACK_B), address(0));
+            second.createStack(_nextJob(), _engineParams(), _coreParams(STACK_B), address(0));
         assertEq(_deposit(EarnVault(secondVault), user, 5e6), 5e6);
         assertEq(_deposit(firstVault, user, 5e6), 5e6);
 
@@ -436,7 +604,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         _unnameFactory(factory);
         vm.prank(operator);
         vm.expectRevert(VedaStackFactory.AuthorizerNotBound.selector);
-        factory.createStack(_engineParams(), _coreParams(keccak256("stack-c")), address(0));
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(keccak256("stack-c")), address(0));
         vm.prank(pauser);
         vm.expectRevert();
         factory.revokeEngine(address(first));
@@ -470,7 +638,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
             hostile.setNext(candidates[i]);
             vm.prank(operator);
             vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.InvalidEngineDeployment.selector, candidates[i]));
-            hostileFactory.deployEngine(_engineParams());
+            hostileFactory.deployEngine(_nextJob(), _engineParams());
         }
         assertEq(hostileFactory.engineCount(), 0);
     }
@@ -489,7 +657,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
             hostile.set(HostileForwarderDeployer.Twist(i), stranger, IBoringQueue(address(otherQueue)));
             vm.prank(operator);
             vm.expectPartialRevert(VedaStackFactory.InvalidForwarderDeployment.selector);
-            hostileFactory.createStack(_engineParams(), _coreParams(STACK_A), address(0));
+            hostileFactory.createStack(_nextJob(), _engineParams(), _coreParams(STACK_A), address(0));
         }
         assertEq(hostileFactory.engineCount(), 0);
     }
@@ -518,7 +686,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     function testTheFactoryCannotBeNamedAdministratorOfANewTransferPolicy() public {
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.InvalidTransferPolicyAdmin.selector, address(factory)));
-        factory.createStack(_engineParams(), _coreParams(STACK_A), address(factory));
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK_A), address(factory));
         assertEq(factory.engineCount(), 0);
     }
 
@@ -705,7 +873,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
 
     function testAForwarderIsBuiltOnlyForAnActiveEngineOfThisFactory() public {
         vm.prank(operator);
-        address pendingEngine = factory.deployEngine(_engineParams());
+        address pendingEngine = factory.deployEngine(_nextJob(), _engineParams());
         address[2] memory engines = [pendingEngine, makeAddr("unknown engine")];
         for (uint256 i = 0; i < engines.length; i++) {
             vm.prank(operator);
@@ -848,7 +1016,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
 
     function testPausersPauseRegistrationsAndOnlyTheAdministratorResumesThem() public {
         vm.prank(operator);
-        address pendingEngine = factory.deployEngine(_engineParams());
+        address pendingEngine = factory.deployEngine(_nextJob(), _engineParams());
         (VedaLockstepEngine engine,,) = _createStack(STACK_A);
 
         vm.prank(operator);
@@ -860,9 +1028,9 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
 
         vm.startPrank(operator);
         vm.expectRevert(VedaStackFactory.RegistrationsPaused.selector);
-        factory.createStack(_engineParams(), _coreParams(STACK_B), address(0));
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK_B), address(0));
         vm.expectRevert(VedaStackFactory.RegistrationsPaused.selector);
-        factory.deployEngine(_engineParams());
+        factory.deployEngine(_nextJob(), _engineParams());
         vm.expectRevert(VedaStackFactory.RegistrationsPaused.selector);
         factory.finalizeStack(pendingEngine, _coreParams(STACK_B), address(0));
         vm.expectRevert(VedaStackFactory.RegistrationsPaused.selector);
@@ -904,9 +1072,9 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         factory.setOperator(newOperator);
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.NotOperator.selector, operator));
-        factory.createStack(_engineParams(), _coreParams(STACK_A), address(0));
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK_A), address(0));
         vm.prank(newOperator);
-        factory.createStack(_engineParams(), _coreParams(STACK_A), address(0));
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK_A), address(0));
         assertEq(factory.engineCount(), 1);
     }
 
@@ -925,7 +1093,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         EarnFactory.DeployParams memory params = _coreParams(STACK_B);
         params.transferPolicyId = existing;
         vm.prank(operator);
-        (,, address protectedShare) = factory.createStack(_engineParams(), params, address(0));
+        (,, address protectedShare) = factory.createStack(_nextJob(), _engineParams(), params, address(0));
         assertEq(StackMockShareToken(protectedShare).transferPolicyId(), existing);
 
         // New: a whitelist created for the given administrator and attached in the same call.
@@ -933,7 +1101,8 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         vm.expectEmit(true, true, false, false, address(factory));
         emit TransferPolicyCreated(existing + 1, newAdmin);
         vm.prank(operator);
-        (,, address freshShare) = factory.createStack(_engineParams(), _coreParams(keccak256("stack-c")), newAdmin);
+        (,, address freshShare) =
+            factory.createStack(_nextJob(), _engineParams(), _coreParams(keccak256("stack-c")), newAdmin);
         assertEq(StackMockShareToken(freshShare).transferPolicyId(), existing + 1);
         (uint8 policyType, address administrator) =
             StackMockTip403Registry(TIP403_REGISTRY_ADDRESS).policyData(existing + 1);
@@ -945,7 +1114,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         params.transferPolicyId = existing;
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.AmbiguousTransferPolicy.selector, existing, newAdmin));
-        factory.createStack(_engineParams(), params, newAdmin);
+        factory.createStack(_nextJob(), _engineParams(), params, newAdmin);
     }
 
     /// @dev Publishes `unadmitted` while the Earn stacks have no access to it.

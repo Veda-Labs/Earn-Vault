@@ -76,6 +76,8 @@ abstract contract VedaStackTestBase is Test {
     address internal operator = makeAddr("operator");
     address internal stackOwner = makeAddr("stack owner");
     address internal forwarderOwner = makeAddr("forwarder owner");
+    /// @dev Set, with `forwarderOwner` a {VedaForwarderSteward}, by a suite whose forwarders are seeded.
+    bool internal forwarderOwnerIsSteward;
     address internal treasury = makeAddr("treasury");
     address internal solverBot = makeAddr("solver bot");
     address internal user = makeAddr("user");
@@ -101,6 +103,7 @@ abstract contract VedaStackTestBase is Test {
     /// @dev Zero unless a variant's Teller keeps an account allowlist.
     IVedaTellerLister internal tellerLister;
     VedaStackFactory internal factory;
+    uint256 private _jobCount;
 
     function setUp() public virtual {
         _deployVeda();
@@ -249,6 +252,7 @@ abstract contract VedaStackTestBase is Test {
             forwarderDeployer: forwarderDeployer,
             forwarderDeployerCodeHash: address(forwarderDeployer).codehash,
             forwarderOwner: forwarderOwner,
+            forwarderOwnerIsSteward: forwarderOwnerIsSteward,
             forwarderTreasury: treasury,
             operator: operator
         });
@@ -261,12 +265,18 @@ abstract contract VedaStackTestBase is Test {
             rolesAuthority.setRoleCapability(role, address(factory), VedaStackFactory.revokeEngine.selector, true);
             rolesAuthority.setRoleCapability(role, address(factory), VedaStackFactory.revokeForwarder.selector, true);
             rolesAuthority.setRoleCapability(role, address(factory), VedaStackFactory.pauseRegistrations.selector, true);
+            rolesAuthority.setRoleCapability(role, address(registry), VedaVaultRegistry.haltDeposits.selector, true);
         }
     }
 
     // ------------------------------------------------------------------
     // Building and using stacks
     // ------------------------------------------------------------------
+
+    /// @dev A fresh job id: each build in a test is its own job.
+    function _nextJob() internal returns (bytes32) {
+        return keccak256(abi.encode("job", ++_jobCount));
+    }
 
     function _engineParams() internal pure returns (VedaStackFactory.EngineParams memory) {
         return VedaStackFactory.EngineParams({ name: "Veda Vault", symbol: "vVAULT", maxRateAge: MAX_RATE_AGE });
@@ -290,7 +300,7 @@ abstract contract VedaStackTestBase is Test {
     {
         vm.prank(operator);
         (address engine_, address earnVault_, address earnShare_) =
-            factory.createStack(_engineParams(), _coreParams(deploymentId), address(0));
+            factory.createStack(_nextJob(), _engineParams(), _coreParams(deploymentId), address(0));
         return (VedaLockstepEngine(engine_), EarnVault(earnVault_), StackMockShareToken(earnShare_));
     }
 

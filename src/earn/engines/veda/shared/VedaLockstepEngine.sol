@@ -215,6 +215,7 @@ contract VedaLockstepEngine is
     error CreditExceedsBalance(address asset, uint256 have, uint256 wantTotal);
     error InvalidVenueShareDecimals();
     error InsufficientAssetsReceived(uint256 minimumAssets, uint256 actualAssets);
+    error DepositsHalted();
     error DepositsNotPaused();
     error DuplicateRequest(bytes32 requestId);
     error EmptyMetadata();
@@ -392,9 +393,12 @@ contract VedaLockstepEngine is
     /// @custom:ensures old(earnVault) != address(0) && msg.sender == old(earnVault)
     /// A deposit credits a positive measured venue-share delta.
     /// @custom:ensures engineShares > 0
-    /// Not proved: liveness. A deposit also needs a fresh Accountant rate, the token pull and the Teller's
-    /// deposit, all outside this contract.
+    /// Not proved: liveness. A deposit also needs the vault's pausers not to have halted this engine's
+    /// deposits, a fresh Accountant rate, the token pull and the Teller's deposit, all outside this
+    /// contract.
     function deposit(uint256 assets) external onlyEarnVault nonReentrant returns (uint256 engineShares) {
+        // The vault's own stop for this stack's deposits, which this engine's owner cannot lift.
+        if (vaultRegistry.depositsHalted(address(this))) revert DepositsHalted();
         IAccountant accountant_ = vaultRegistry.accountant();
         _requireFreshAccountantRate(accountant_, maxRateAge);
         _checkpointRate(accountant_);

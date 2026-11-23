@@ -199,12 +199,12 @@ contract VedaTellerListerTest is VedaAllowlistStackTestBase {
 
         vm.prank(operator);
         vm.expectPartialRevert(VedaStackFactory.NotListedOnTeller.selector);
-        rolesOnly.createStack(_engineParams(), _coreParams(STACK_A), address(0));
+        rolesOnly.createStack(_nextJob(), _engineParams(), _coreParams(STACK_A), address(0));
         assertEq(rolesOnly.engineCount(), 0);
 
         // In two transactions, whoever keeps the Teller's list can list the engine in between.
         vm.prank(operator);
-        address engine = rolesOnly.deployEngine(_engineParams());
+        address engine = rolesOnly.deployEngine(_nextJob(), _engineParams());
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.NotListedOnTeller.selector, engine, address(teller)));
         rolesOnly.finalizeStack(engine, _coreParams(STACK_A), address(0));
@@ -224,7 +224,7 @@ contract VedaTellerListerTest is VedaAllowlistStackTestBase {
         );
         vm.prank(operator);
         vm.expectRevert(bytes("UNAUTHORIZED"));
-        factory.createStack(_engineParams(), _coreParams(STACK_A), address(0));
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK_A), address(0));
         assertEq(factory.engineCount(), 0);
     }
 
@@ -239,7 +239,7 @@ contract VedaTellerListerTest is VedaAllowlistStackTestBase {
 
         vm.prank(operator);
         vm.expectRevert();
-        factory.createStack(_engineParams(), _coreParams(STACK_A), address(0));
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK_A), address(0));
         assertEq(factory.engineCount(), 0);
     }
 
@@ -254,7 +254,7 @@ contract VedaTellerListerTest is VedaAllowlistStackTestBase {
 
         vm.prank(operator);
         vm.expectPartialRevert(VedaTellerLister.ListingFailed.selector);
-        factory.createStack(_engineParams(), _coreParams(STACK_A), address(0));
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK_A), address(0));
         assertEq(forgetful.listingCalls(), 0);
         assertEq(factory.engineCount(), 0);
     }
@@ -482,6 +482,57 @@ contract VedaTellerListerTest is VedaAllowlistStackTestBase {
         assertTrue(listed.allowedAccounts(address(solver)));
     }
 
+    function testWhereAnyoneMayCallBulkDepositADepositHaltDoesNotStopSharesMintedStraightToTheEngine() public {
+        // A known limit, pinned so that it is not mistaken for a stop. The halt lives in the engine's
+        // own deposit. On this vault anyone may call the Teller's bulk deposit for a listed recipient,
+        // and the EarnVault absorbs shares that arrive on its engine, so a stack's position can still
+        // grow. Only a Teller that restricts who may call bulk deposit, or delisting, stops that.
+        (VedaLockstepEngine engine, EarnVault earnVault,) = _createStack(STACK_A);
+        _deposit(earnVault, user, 100e6);
+        vm.prank(pauser);
+        registry.haltDeposits(address(engine));
+
+        asset.mint(user, 60e6);
+        vm.startPrank(user);
+        asset.approve(address(earnVault), 10e6);
+        vm.expectRevert(VedaLockstepEngine.DepositsHalted.selector);
+        earnVault.deposit(10e6, user, 1);
+
+        uint256 managedBefore = earnVault.totalAssets();
+        asset.approve(address(vault), 50e6);
+        teller.bulkDeposit(address(asset), 50e6, 0, address(engine));
+        earnVault.absorbEngineShareSurplus(50e6);
+        vm.stopPrank();
+        assertEq(earnVault.totalAssets() - managedBefore, 50e6);
+
+        // Delisting does stop it, together with the stack's exits.
+        vm.prank(pauser);
+        factory.revokeEngine(address(engine));
+        vm.startPrank(user);
+        asset.approve(address(vault), 1e6);
+        vm.expectRevert(bytes("NOT_ALLOWED"));
+        teller.bulkDeposit(address(asset), 1e6, 0, address(engine));
+        vm.stopPrank();
+    }
+
+    function testForwarderReadinessFollowsTheTellersListToo() public {
+        (VedaLockstepEngine engine,,) = _createStack(STACK_A);
+        VedaForwardingSolver forwarder = VedaForwardingSolver(factory.stack(address(engine)).forwarder);
+        vm.prank(forwarderOwner);
+        forwarder.setAuthorizedSolver(solverBot, true);
+        assertTrue(factory.isForwarderReady(address(forwarder), solverBot));
+
+        // The stock solver redeems every settled request, so it must be on the list...
+        _setListedDirectly(address(solver), false);
+        assertFalse(factory.isForwarderReady(address(forwarder), solverBot));
+        _setListedDirectly(address(solver), true);
+        // ...and the Queue settles nothing for an engine that is not.
+        _setListedDirectly(address(engine), false);
+        assertFalse(factory.isForwarderReady(address(forwarder), solverBot));
+        _setListedDirectly(address(engine), true);
+        assertTrue(factory.isForwarderReady(address(forwarder), solverBot));
+    }
+
     function testAQueueThatAppliesNoListKeepsSettlingForADelistedEngine() public {
         // The registry publishes such a vault; the lister's setup assertion is what refuses it.
         (VedaLockstepEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
@@ -608,7 +659,7 @@ contract VedaTellerListerTest is VedaAllowlistStackTestBase {
         assertFalse(factory.isAuthorizerBound());
         vm.prank(operator);
         vm.expectRevert(VedaStackFactory.AuthorizerNotBound.selector);
-        factory.createStack(_engineParams(), _coreParams(STACK_B), address(0));
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK_B), address(0));
         // A pauser still takes the engine's role away, and is told the listing stayed. The listing
         // is then the administrator's to revoke.
         vm.expectEmit(true, true, false, true, address(factory));
@@ -791,7 +842,7 @@ contract VedaTellerListerTest is VedaAllowlistStackTestBase {
 
         vm.prank(operator);
         (address engine, address earnVault, address earnShare) =
-            listing.createStack(_engineParams(), _coreParams(STACK_A), address(0));
+            listing.createStack(_nextJob(), _engineParams(), _coreParams(STACK_A), address(0));
         assertEq(listing.stack(engine).forwarder, address(0));
         assertEq(rolesAuthority.getUserRoles(engine), bytes32(0));
         assertTrue(listed.allowedAccounts(engine));
@@ -842,7 +893,7 @@ contract VedaTellerListerTest is VedaAllowlistStackTestBase {
         _rotate(teller, queue, solver);
         vm.prank(operator);
         vm.expectPartialRevert(VedaStackFactory.NotAuthorizedOnVeda.selector);
-        listing.createStack(_engineParams(), _coreParams(STACK_B), address(0));
+        listing.createStack(_nextJob(), _engineParams(), _coreParams(STACK_B), address(0));
         assertEq(listing.engineCount(), 1);
     }
 
@@ -858,10 +909,10 @@ contract VedaTellerListerTest is VedaAllowlistStackTestBase {
 
         vm.prank(operator);
         vm.expectPartialRevert(VedaStackFactory.NotListedOnTeller.selector);
-        bare.createStack(_engineParams(), _coreParams(STACK_A), address(0));
+        bare.createStack(_nextJob(), _engineParams(), _coreParams(STACK_A), address(0));
 
         vm.prank(operator);
-        address engine = bare.deployEngine(_engineParams());
+        address engine = bare.deployEngine(_nextJob(), _engineParams());
         _setListedDirectly(engine, true);
         vm.prank(operator);
         (address earnVault,) = bare.finalizeStack(engine, _coreParams(STACK_A), address(0));
