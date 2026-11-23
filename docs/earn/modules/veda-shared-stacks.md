@@ -422,6 +422,23 @@ move it.
   vault's side has no deposit-only stop: `revokeEngine` is its lever.
 - **The whole vault.** Pause the Teller as before; these contracts do not change that.
 
+### Moving an existing stack onto the vault
+
+The factory builds an engine only together with a new EarnVault. It has no call that builds one
+for an EarnVault that already exists, so a stack that moves here from another BoringVault through
+[whole-pool engine migration](../architecture/system.md#whole-pool-engine-migration) is the one
+case that still needs the administrator for each stack:
+
+1. the stack's owner deploys a `VedaEngine` on this vault's registry and binds it to the existing
+   EarnVault, which the registry allows for any engine;
+2. the administrator gives that engine the Earn engine role on the RolesAuthority directly and,
+   where the Teller keeps a list, lists it or lets `relist` carry it, since it now holds the role;
+   and
+3. the EarnVault's operator calls `migrateEngine`.
+
+Such an engine is in no factory's records. Pausers cannot revoke it, the operator cannot build it a
+forwarding solver, and the administrator revokes it by hand, the role first and the listing after.
+
 ### Replacing the factory
 
 A factory is pinned to exact engine and core code, so a new release means a new factory, deployed
