@@ -17,6 +17,7 @@ import { IBoringQueue } from "../../../../interfaces/external/veda/IBoringQueue.
 import { IBoringSolver } from "../../../../interfaces/external/veda/IBoringSolver.sol";
 import { IAuth, IAuthority } from "../../../../interfaces/external/veda/IRolesAuthority.sol";
 import { ITeller } from "../../../../interfaces/external/veda/ITeller.sol";
+import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import { EarnFactory } from "../../../core/EarnFactory.sol";
 import { EarnFees } from "../../../core/EarnFees.sol";
 import { EarnVault } from "../../../core/EarnVault.sol";
@@ -57,7 +58,11 @@ import { VedaTellerAllowlist } from "./VedaTellerAllowlist.sol";
 ///      operator key: stacks of its choosing, with that timing exposure, which dilutes every holder of
 ///      the BoringVault, and further forwarding solvers for existing stacks, which settle nothing until
 ///      an engine's owner admits them. It never reaches a role, the registry, another stack's settings
-///      or vault custody. The vault's pausers, and its administrator, can
+///      or vault custody. With an `approver` set, the operator builds only a stack whose settings the
+///      approver signed, so a leaked operator key alone builds no stack; it can still deploy engines
+///      that are bound to nothing, use up job ids, and build forwarding solvers for existing stacks.
+///      The approver is this factory's alone: another factory named for the same vault without one
+///      lets its operator build alone. The vault's pausers, and its administrator, can
 ///      revoke an engine or a forwarder and pause new registrations; pausing is the first response to a
 ///      leaked operator, since it stops every stack-building call at once. Only the administrator
 ///      reinstates, resumes, or replaces the operator. Pausers are the accounts the BoringVault's
@@ -112,6 +117,7 @@ contract VedaStackFactory {
         bool forwarderOwnerIsSteward;
         address forwarderTreasury;
         address operator;
+        address approver;
     }
 
     /// @notice The engine's own settings; the vault's registry supplies everything else it needs.
@@ -119,6 +125,12 @@ contract VedaStackFactory {
         string name;
         string symbol;
         uint64 maxRateAge;
+    }
+
+    /// @notice The approver's signature over one stack's settings, good until `deadline`.
+    struct Approval {
+        uint256 deadline;
+        bytes signature;
     }
 
     struct StackRecord {
@@ -163,10 +175,21 @@ contract VedaStackFactory {
     /// @notice Where every forwarding solver built here sends rescued surplus.
     address public immutable forwarderTreasury;
 
+    bytes32 private constant DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    /// @dev The fields a person approving a stack most needs to read, and one hash over every setting.
+    bytes32 private constant APPROVAL_TYPEHASH = keccak256(
+        "StackApproval(bytes32 jobId,address owner,uint64 maxRateAge,uint64 transferPolicyId,address newTransferPolicyAdmin,bytes32 settingsHash,uint256 deadline)"
+    );
+
     /// @notice The only account that builds stacks.
     address public operator;
+
     /// @notice While set, no engine, stack or forwarding solver is built or authorized.
     bool public registrationsPaused;
+    /// @notice A second key that must sign each stack's settings before the operator can build it, or
+    ///         zero when the operator alone decides. An account, or a contract that answers ERC-1271.
+    address public approver;
 
     /// @notice The engine built for each job id; zero when no build under that id has landed. A job id
     ///         builds one engine, so a build that is sent twice lands once.
@@ -196,9 +219,13 @@ contract VedaStackFactory {
     event ForwarderAuthorizationChanged(address indexed forwarder, bool authorized, address indexed by);
     event RegistrationsPauseChanged(bool paused, address indexed by);
     event OperatorChanged(address indexed oldOperator, address indexed newOperator);
+    event ApproverChanged(address indexed oldApprover, address indexed newApprover);
+    event StackApproved(bytes32 indexed jobId, address indexed approver, bytes32 digest);
     event TransferPolicyCreated(uint64 indexed policyId, address indexed admin);
 
     error AmbiguousTransferPolicy(uint64 transferPolicyId, address newPolicyAdmin);
+    error ApprovalExpired(uint256 deadline);
+    error ApprovalRequired();
     error AuthorizerNotBound();
     error CodeHashMismatch(address account, bytes32 expected, bytes32 actual);
     error EmptyJobId();
@@ -211,10 +238,13 @@ contract VedaStackFactory {
     error ForwarderNotSeeded(address forwarder);
     error ForwarderNotRevoked(address forwarder);
     error InvalidEngineDeployment(address engine);
+    error InvalidApproval();
+    error InvalidApprover(address approver);
     error InvalidFactoryWiring(address account);
     error InvalidForwarderDeployment(address forwarder);
     error InvalidTransferPolicyAdmin(address admin);
     error JobAlreadyBuilt(bytes32 jobId, address engine);
+    error JobNotThisEngine(bytes32 jobId, address engine);
     error NotAuthorizedOnVeda(address account, address target, bytes4 functionSig);
     error NotListedOnTeller(address engine, address teller);
     error NotOperator(address caller);
@@ -295,6 +325,9 @@ contract VedaStackFactory {
         forwarderTreasury = config.forwarderTreasury;
         operator = config.operator;
         emit OperatorChanged(address(0), config.operator);
+        _requireSecondKey(config.approver, config.operator);
+        approver = config.approver;
+        emit ApproverChanged(address(0), config.approver);
     }
 
     // ------------------------------------------------------------------
@@ -319,6 +352,24 @@ contract VedaStackFactory {
         EarnFactory.DeployParams calldata core,
         address newTransferPolicyAdmin
     ) external onlyOperator nonReentrant returns (address engine, address earnVault, address earnShare) {
+        if (approver != address(0)) revert ApprovalRequired();
+        engine = _deployEngine(jobId, engineParams);
+        (earnVault, earnShare) = _finalizeStack(engine, core, newTransferPolicyAdmin);
+    }
+
+    /// @notice {createStack} with the approver's signature over exactly these settings.
+    /// @dev The signature covers this chain and factory, the job id, every engine and core setting
+    ///      but the deployment id, the transfer policy choice and a deadline ({approvalDigest}). The
+    ///      job id builds one engine, so an approval is used once; it cannot be withdrawn before its
+    ///      deadline, so deadlines are kept short. While no approver is set the approval is not read.
+    function createStack(
+        bytes32 jobId,
+        EngineParams calldata engineParams,
+        EarnFactory.DeployParams calldata core,
+        address newTransferPolicyAdmin,
+        Approval calldata approval
+    ) external onlyOperator nonReentrant returns (address engine, address earnVault, address earnShare) {
+        _requireApproved(jobId, engineParams, core, newTransferPolicyAdmin, approval);
         engine = _deployEngine(jobId, engineParams);
         (earnVault, earnShare) = _finalizeStack(engine, core, newTransferPolicyAdmin);
     }
@@ -344,6 +395,30 @@ contract VedaStackFactory {
         nonReentrant
         returns (address earnVault, address earnShare)
     {
+        if (approver != address(0)) revert ApprovalRequired();
+        (earnVault, earnShare) = _finalizeStack(engine, core, newTransferPolicyAdmin);
+    }
+
+    /// @notice {finalizeStack} with the approver's signature, as in the approved {createStack}.
+    /// @dev `jobId` is the job the engine was deployed under. The engine's settings are read from the
+    ///      engine itself, so the approval holds only for an engine deployed with the settings it
+    ///      names: an engine planted under the job with other settings cannot be finalized with it.
+    function finalizeStack(
+        address engine,
+        EarnFactory.DeployParams calldata core,
+        address newTransferPolicyAdmin,
+        bytes32 jobId,
+        Approval calldata approval
+    ) external onlyOperator nonReentrant returns (address earnVault, address earnShare) {
+        if (engine == address(0) || engineOf[jobId] != engine) {
+            revert JobNotThisEngine(jobId, engine);
+        }
+        EngineParams memory engineParams = EngineParams({
+            name: VedaLockstepEngine(engine).name(),
+            symbol: VedaLockstepEngine(engine).symbol(),
+            maxRateAge: VedaLockstepEngine(engine).maxRateAge()
+        });
+        _requireApproved(jobId, engineParams, core, newTransferPolicyAdmin, approval);
         (earnVault, earnShare) = _finalizeStack(engine, core, newTransferPolicyAdmin);
     }
 
@@ -464,9 +539,17 @@ contract VedaStackFactory {
         emit RegistrationsPauseChanged(false, msg.sender);
     }
 
+    /// @notice Sets or replaces the approver, or removes it with zero so the operator alone builds.
+    function setApprover(address newApprover) external onlyVaultAdmin {
+        _requireSecondKey(newApprover, operator);
+        emit ApproverChanged(approver, newApprover);
+        approver = newApprover;
+    }
+
     /// @notice Replaces the operator, for example after a key rotation.
     function setOperator(address newOperator) external onlyVaultAdmin {
         if (newOperator == address(0)) revert ZeroAddress();
+        _requireSecondKey(approver, newOperator);
         emit OperatorChanged(operator, newOperator);
         operator = newOperator;
     }
@@ -474,6 +557,42 @@ contract VedaStackFactory {
     // ------------------------------------------------------------------
     // Views
     // ------------------------------------------------------------------
+
+    /// @notice The EIP-712 digest the approver signs to let the operator build exactly this stack on
+    ///         this factory and chain, until `deadline`.
+    /// @dev Type `StackApproval(bytes32 jobId,address owner,uint64 maxRateAge,uint64 transferPolicyId,
+    ///      address newTransferPolicyAdmin,bytes32 settingsHash,uint256 deadline)` under the domain
+    ///      `VedaStackFactory`, version `1`. `settingsHash` is `keccak256(abi.encode(engineParams,
+    ///      core))` with `core.deploymentId` and `core.engine` zeroed, so it commits to every setting
+    ///      the operator chooses but the deployment id, which only salts the stack's addresses and may
+    ///      have to change when a finalize is retried. The named fields repeat the ones a signer most
+    ///      needs to see and are taken from the same arguments; a signer shown only those signs the
+    ///      rest unseen, so it recomputes the digest from settings it got from its own source. An
+    ///      existing transfer policy is bound by its id only, not by who administers it.
+    function approvalDigest(
+        bytes32 jobId,
+        EngineParams memory engineParams,
+        EarnFactory.DeployParams calldata core,
+        address newTransferPolicyAdmin,
+        uint256 deadline
+    ) public view returns (bytes32) {
+        bytes32 structHash = keccak256(
+            abi.encode(
+                APPROVAL_TYPEHASH,
+                jobId,
+                core.owner,
+                engineParams.maxRateAge,
+                core.transferPolicyId,
+                newTransferPolicyAdmin,
+                _settingsHash(engineParams, core),
+                deadline
+            )
+        );
+        bytes32 domainSeparator = keccak256(
+            abi.encode(DOMAIN_TYPEHASH, keccak256("VedaStackFactory"), keccak256("1"), block.chainid, address(this))
+        );
+        return keccak256(abi.encodePacked(hex"1901", domainSeparator, structHash));
+    }
 
     /// @notice The record of the stack built around `engine`; a zero status means this factory did not
     ///         build it.
@@ -720,6 +839,42 @@ contract VedaStackFactory {
     function _revertWith(bytes memory reason) private pure {
         assembly ("memory-safe") {
             revert(add(reason, 0x20), mload(reason))
+        }
+    }
+
+    /// @dev With an approver set, requires its unexpired signature over exactly these settings.
+    function _requireApproved(
+        bytes32 jobId,
+        EngineParams memory engineParams,
+        EarnFactory.DeployParams calldata core,
+        address newTransferPolicyAdmin,
+        Approval calldata approval
+    ) private {
+        address approver_ = approver;
+        if (approver_ == address(0)) return;
+        if (block.timestamp > approval.deadline) revert ApprovalExpired(approval.deadline);
+        bytes32 digest = approvalDigest(jobId, engineParams, core, newTransferPolicyAdmin, approval.deadline);
+        if (!SignatureChecker.isValidSignatureNow(approver_, digest, approval.signature)) revert InvalidApproval();
+        emit StackApproved(jobId, approver_, digest);
+    }
+
+    /// @dev Every engine and core setting but the deployment id and the engine this factory supplies.
+    function _settingsHash(EngineParams memory engineParams, EarnFactory.DeployParams calldata core)
+        private
+        pure
+        returns (bytes32)
+    {
+        EarnFactory.DeployParams memory settings = core;
+        settings.deploymentId = bytes32(0);
+        settings.engine = address(0);
+        return keccak256(abi.encode(engineParams, settings));
+    }
+
+    /// @dev An approver is a second key: never the operator's, and never this contract, which signs
+    ///      nothing. Zero means no approver.
+    function _requireSecondKey(address approver_, address operator_) private view {
+        if (approver_ != address(0) && (approver_ == operator_ || approver_ == address(this))) {
+            revert InvalidApprover(approver_);
         }
     }
 

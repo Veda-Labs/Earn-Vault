@@ -150,6 +150,34 @@ to no settings and is the operator's to use, so a caller told its job was alread
 engine's settings and stack owner before adopting it. `discardEngine(engine)`, a pauser's, sets a
 pending engine aside for good, for one deployed by an operator key that is no longer trusted.
 
+**Approver.** A factory may name an `approver`, a second key that must sign each stack's settings
+before the operator can build it; the administrator sets, replaces or removes it (`setApprover`), and
+it is never the operator's own key. While one is set, `createStack` and `finalizeStack` revert
+(`ApprovalRequired`) unless called with an `Approval`: a deadline and the approver's signature over
+`approvalDigest(jobId, engineParams, core, newTransferPolicyAdmin, deadline)`.
+
+- **What it covers.** That EIP-712 digest covers this chain and factory, the job id, every engine
+  and core setting the operator chooses except `core.deploymentId`, and the transfer policy choice. A
+  changed setting, another job, factory or chain, or a passed deadline is refused
+  (`InvalidApproval`, `ApprovalExpired`). The deployment id only salts the stack's addresses, so a
+  finalize that has to be retried under another id needs no new signature.
+- **What it does not cover.** What the factory decides for itself: its wiring, and whether the vault
+  publishes a Queue when the stack is built. An existing transfer policy is bound by its id, not by
+  who administers it. `deployEngine` and `deployForwarder` need no approval: an engine deployed and
+  never finalized is bound to nothing, and a forwarder settles nothing until its engine's owner
+  admits it.
+- **One build.** The job id makes an approval good for one build, and `StackApproved` records it.
+  An approval cannot be withdrawn before its deadline, so keep deadlines short.
+- **The two-call build.** The approved `finalizeStack` takes the job id and reads the engine's
+  settings from the engine, so an engine deployed under the job with other settings cannot use the
+  approval.
+- **Who signs.** A secp256k1 account, or a contract that answers ERC-1271. The digest names the
+  owner, the rate age bound and the policy for a signer to read and hashes the rest, so a signer
+  shown only those fields signs the fees, controls and recipients unseen: the approver recomputes the
+  digest from settings it obtained from its own source, not from the operator's.
+- **Per factory.** The approver is one factory's. Every factory named for a vault needs its own, or
+  that factory's operator builds alone.
+
 `core` is the canonical `EarnFactory.DeployParams` with `engine` left zero. `core.owner` becomes the
 EarnVault's operator and the engine's owner. `core.transferPolicyId` is attached as given, with zero
 meaning unrestricted; a nonzero `newTransferPolicyAdmin` instead creates a TIP-403 whitelist
@@ -182,11 +210,11 @@ further solver adds a storage write to every forwarder built.
 core first and make it revert; finalize again under another `deploymentId`. Such a core is bound to
 nothing and holds nothing.
 
-| Caller        | Functions                                                                                             |
-| ------------- | ----------------------------------------------------------------------------------------------------- |
-| Operator      | `createStack`, `deployEngine`, `finalizeStack`, `deployForwarder`                                     |
-| Pausers       | `revokeEngine`, `revokeForwarder`, `pauseRegistrations`, `discardEngine`                              |
-| Administrator | The pausers' functions, `reinstateEngine`, `reinstateForwarder`, `resumeRegistrations`, `setOperator` |
+| Caller        | Functions                                                                                                            |
+| ------------- | -------------------------------------------------------------------------------------------------------------------- |
+| Operator      | `createStack`, `deployEngine`, `finalizeStack`, `deployForwarder`                                                    |
+| Pausers       | `revokeEngine`, `revokeForwarder`, `pauseRegistrations`, `discardEngine`                                             |
+| Administrator | The pausers' functions, `reinstateEngine`, `reinstateForwarder`, `resumeRegistrations`, `setOperator`, `setApprover` |
 
 Pausers are the accounts the BoringVault's authority allows to call that function on the factory;
 the administrator grants those capabilities to the vault's pause roles. Pausing and revoking only
@@ -393,7 +421,7 @@ runs before handing the vault over. Before that batch, review:
 
 - the verified code of the registry, the authorizer and the factory, since the onchain checks cover
   their wiring and never their code;
-- the factory's `registry`, `authorizer`, `tellerLister`, `operator`, `forwarderOwner`,
+- the factory's `registry`, `authorizer`, `tellerLister`, `operator`, `approver`, `forwarderOwner`,
   `forwarderOwnerIsSteward`, `forwarderTreasury` and three pinned code hashes, against the registry being published on and the
   reviewed release;
 - with the role granter, its `rolesAuthority`, `registry` and two role numbers, and that
@@ -476,6 +504,8 @@ it:
 
 ### Incidents
 
+- **A leaked approver key.** It builds nothing without the operator. Have the administrator replace
+  it (`setApprover`).
 - **A leaked operator key.** Call `pauseRegistrations` first: it stops every operator call at once.
   Then revoke the engines that key built, and have the administrator replace the operator
   (`setOperator`) before it resumes registrations.
@@ -520,18 +550,18 @@ factory's own record unchanged.
 None of these contracts is the vault's owner or can reach `manage`, `enter`, `exit`, `setAuthority`
 or `transferOwnership` on it.
 
-| If this fails                 | Worst case                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Operator key leaks            | Stacks with an owner, fees, controls, rate age bound and transfer policy of the attacker's choice. Their deposits and exits skip the Teller's share lock, so their owner can enter before a rate update and leave after it, which dilutes every holder of the BoringVault. Also forwarding solvers for existing stacks, which settle nothing until an engine's owner admits them. No role, no registry, no other stack's settings, no custody. |
-| Factory has a bug             | An authorization for an address that is not a genuine engine or forwarding solver: the same access as above, and for a forwarder, solving requests on the vault's Queue                                                                                                                                                                                                                                                                        |
-| Role granter has a bug        | Any role to anyone, which is custody of the vault. Nothing bounds it but its code.                                                                                                                                                                                                                                                                                                                                                             |
-| Teller lister has a bug       | A wrong list on the Teller: an account that may enter and leave the vault without the share lock, or engines whose deposits and exits stop. No role, no custody, no other Teller setting.                                                                                                                                                                                                                                                      |
-| Forwarder steward's owner     | The solvers on every forwarder it owns, their treasuries and their surplus. A solver it approves can trigger settlement, which pays request owners through their engines. No custody of the vault.                                                                                                                                                                                                                                             |
-| A solver key leaks or is lost | Leaked: settlements at a time of the holder's choosing, paid as recorded. Lost: queued exits wait, and can pass their deadline, until the steward's owner lists another solver and each forwarder is seeded.                                                                                                                                                                                                                                   |
-| Overlay or its registry fails | A wrong answer for a call on the Teller, a Queue or a stock solver. A reverting RolesAuthority is the only way it denies an existing permission.                                                                                                                                                                                                                                                                                               |
-| Pauser is compromised         | Every stack revoked, every stack's deposits halted and registrations paused until the administrator restores them. No funds move.                                                                                                                                                                                                                                                                                                              |
-| A stack's owner is malicious  | Misuse of that engine's settings, as for any Veda stack ([Veda](veda.md#vedaengine)). No other stack is affected.                                                                                                                                                                                                                                                                                                                              |
-| Administrator                 | Unchanged in power. One publication now reaches every stack.                                                                                                                                                                                                                                                                                                                                                                                   |
+| If this fails                 | Worst case                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Operator key leaks            | With an approver set: engines that are bound to nothing, used job ids, and forwarding solvers for existing stacks; no stack. Without one: stacks with an owner, fees, controls, rate age bound and transfer policy of the attacker's choice. Their deposits and exits skip the Teller's share lock, so their owner can enter before a rate update and leave after it, which dilutes every holder of the BoringVault. Also forwarding solvers for existing stacks, which settle nothing until an engine's owner admits them. No role, no registry, no other stack's settings, no custody. |
+| Factory has a bug             | An authorization for an address that is not a genuine engine or forwarding solver: the same access as above, and for a forwarder, solving requests on the vault's Queue                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Role granter has a bug        | Any role to anyone, which is custody of the vault. Nothing bounds it but its code.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Teller lister has a bug       | A wrong list on the Teller: an account that may enter and leave the vault without the share lock, or engines whose deposits and exits stop. No role, no custody, no other Teller setting.                                                                                                                                                                                                                                                                                                                                                                                                |
+| Forwarder steward's owner     | The solvers on every forwarder it owns, their treasuries and their surplus. A solver it approves can trigger settlement, which pays request owners through their engines. No custody of the vault.                                                                                                                                                                                                                                                                                                                                                                                       |
+| A solver key leaks or is lost | Leaked: settlements at a time of the holder's choosing, paid as recorded. Lost: queued exits wait, and can pass their deadline, until the steward's owner lists another solver and each forwarder is seeded.                                                                                                                                                                                                                                                                                                                                                                             |
+| Overlay or its registry fails | A wrong answer for a call on the Teller, a Queue or a stock solver. A reverting RolesAuthority is the only way it denies an existing permission.                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Pauser is compromised         | Every stack revoked, every stack's deposits halted and registrations paused until the administrator restores them. No funds move.                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| A stack's owner is malicious  | Misuse of that engine's settings, as for any Veda stack ([Veda](veda.md#vedaengine)). No other stack is affected.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Administrator                 | Unchanged in power. One publication now reaches every stack.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 Each stack picks its own EarnShare transfer policy; a vault-level rule is not inherited. Registration
 must never be opened to everyone, for that reason and for the share-lock exposure above. The
@@ -560,6 +590,9 @@ bound to it.
   table changes.
 - `VedaAuthorityOverlay.t.sol`: pass-through of the RolesAuthority, the five added calls, denial
   without reverting when the registry is broken, and that nothing writes to the RolesAuthority.
+- `VedaStackApprover.t.sol`: with an approver set the operator builds only what was signed, an
+  approval covers every setting, one factory, one chain, one build and a limited time, and it holds
+  through the two-call build only for an engine deployed with the settings it names.
 - `VedaForwarderSteward.t.sol`: a forwarder built with the vault's solver approved settles with no
   transaction from its owner, the list reaches every forwarder through `seed` and `prune`, and
   `isForwarderReady` follows everything a queued exit needs.

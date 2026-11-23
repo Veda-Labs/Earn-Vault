@@ -74,6 +74,8 @@ abstract contract VedaStackTestBase is Test {
     address internal admin = makeAddr("timelock");
     address internal pauser = makeAddr("pauser safe");
     address internal operator = makeAddr("operator");
+    /// @dev Zero unless a suite builds stacks that need a second key's signature.
+    address internal approver;
     address internal stackOwner = makeAddr("stack owner");
     address internal forwarderOwner = makeAddr("forwarder owner");
     /// @dev Set, with `forwarderOwner` a {VedaForwarderSteward}, by a suite whose forwarders are seeded.
@@ -254,7 +256,8 @@ abstract contract VedaStackTestBase is Test {
             forwarderOwner: forwarderOwner,
             forwarderOwnerIsSteward: forwarderOwnerIsSteward,
             forwarderTreasury: treasury,
-            operator: operator
+            operator: operator,
+            approver: approver
         });
     }
 
