@@ -9,6 +9,7 @@ import { IBoringVault } from "../../../../interfaces/external/veda/IBoringVault.
 import { IAuth, IAuthority, IBoringVaultCustody } from "../../../../interfaces/external/veda/IRolesAuthority.sol";
 import { ITeller } from "../../../../interfaces/external/veda/ITeller.sol";
 import { VedaAccountantFreshness } from "./VedaAccountantFreshness.sol";
+import { VedaTellerAllowlist } from "./VedaTellerAllowlist.sol";
 
 /// @title VedaVaultRegistry
 /// @notice Per-vault source of truth for the Teller, optional tracking Queue with its stock solver, and
@@ -24,11 +25,12 @@ import { VedaAccountantFreshness } from "./VedaAccountantFreshness.sol";
 ///      older than the caller allows, and a safe rate inside the caller's bounds. It also requires that
 ///      the Teller can already mint and burn the vault's shares, because a Teller that cannot would stop
 ///      every stack in the same block. Those checks catch mixed wiring, a stale report, an unexpected
-///      rate jump and a Teller without its vault permissions. They cannot show that a module's bytecode
-///      is benign, that the Earn stacks or the stock solver hold their permissions on the new modules,
-///      or that the caller chose tight bounds; those stay with the review of the publication. Bounds
-///      as wide as `1` and the maximum waive the rate check, and a rate that jumps inside the bounds
-///      is priced by every stack at once, fees included.
+///      rate jump, a Teller without its vault permissions and, where the Teller keeps an account
+///      allowlist, a Queue bound to another Teller's list or a stock solver that is not on it. They
+///      cannot show that a module's bytecode is benign, that the Earn stacks hold their permissions or
+///      their places on the new Teller's list, or that the caller chose tight bounds; those stay with
+///      the review of the publication. Bounds as wide as `1` and the maximum waive the rate check, and
+///      a rate that jumps inside the bounds is priced by every stack at once, fees included.
 contract VedaVaultRegistry is IVedaVaultRegistry {
     IBoringVault public immutable vault;
     address public immutable baseAsset;
@@ -53,8 +55,10 @@ contract VedaVaultRegistry is IVedaVaultRegistry {
     error InvalidVedaPeriphery(address account);
     error InvalidVedaPeripheryWiring(address component, address expected, address actual);
     error InvalidVedaRateBounds(uint256 minRate, uint256 maxRate);
+    error SolverNotListedOnTeller(address solver, address teller);
     error NotVaultAdmin(address caller);
     error QueueSolverMismatch(address queue, address solver);
+    error QueueTellerMismatch(address queue, address expected, address actual);
     error QueueTrackingDisabled(address queue);
     error StaleAccountantRate(uint256 updatedAt, uint256 currentTime, uint256 maxAge);
     error TellerNotAuthorizedOnVault(address teller, bytes4 functionSig);
@@ -159,6 +163,7 @@ contract VedaVaultRegistry is IVedaVaultRegistry {
             _requireWiring(address(newQueue), expectedVault, newQueue.boringVault());
             _requireWiring(address(newQueue), address(newAccountant), newQueue.accountant());
             if (!newQueue.trackWithdrawsOnChain()) revert QueueTrackingDisabled(address(newQueue));
+            _requireAllowlistWiring(address(newTeller), address(newQueue), address(newSolver));
         }
         _requireWiring(address(newAccountant), expectedVault, newAccountant.vault());
         _requireWiring(address(newAccountant), baseAsset, newAccountant.base());
@@ -199,6 +204,19 @@ contract VedaVaultRegistry is IVedaVaultRegistry {
                 revert TellerNotAuthorizedOnVault(newTeller, vaultFunctions[i]);
             }
         }
+    }
+
+    /// @dev Where the Teller keeps an account allowlist: a Queue that checks one must check this
+    ///      Teller's, or it would settle against a list the vault's engines are not on, and the stock
+    ///      solver must be on it, because the solver redeems every settled request through the Teller.
+    ///      Modules that expose neither reading are taken to have no allowlist.
+    function _requireAllowlistWiring(address newTeller, address newQueue, address newSolver) private view {
+        (bool queueChecks, address queueTeller) = VedaTellerAllowlist.tryQueueTeller(newQueue);
+        if (queueChecks && queueTeller != address(0) && queueTeller != newTeller) {
+            revert QueueTellerMismatch(newQueue, newTeller, queueTeller);
+        }
+        (bool tellerChecks, bool solverAllowed) = VedaTellerAllowlist.tryIsWithdrawAllowed(newTeller, newSolver);
+        if (tellerChecks && !solverAllowed) revert SolverNotListedOnTeller(newSolver, newTeller);
     }
 
     function _validateContract(address account) internal view {

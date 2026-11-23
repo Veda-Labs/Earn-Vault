@@ -41,8 +41,22 @@ interface IVedaStackAccess {
     function canStackCall(address user, address target, bytes4 functionSig) external view returns (bool);
 }
 
-/// @notice The wiring a `VedaStackFactory` reports, which an authorizer checks before accepting it.
+/// @notice The seam through which a {VedaStackFactory} puts the engines it builds on the allowlist of a
+///         Teller that checks accounts as well as callers. `VedaTellerLister` implements it.
+interface IVedaTellerLister {
+    /// @notice Whether the vault's administrator has named `factory` as a caller the lister accepts.
+    function isFactory(address factory) external view returns (bool);
+    /// @notice Lists `engine` on the vault's published Teller, or delists it.
+    /// @return applied Whether the Teller's list now says so. Listing reverts when it does not;
+    ///         delisting records the engine as delisted either way and reports whether the Teller
+    ///         took the change.
+    function setEngineListed(address engine, bool listed) external returns (bool applied);
+}
+
+/// @notice The wiring a `VedaStackFactory` reports, which an authorizer or a lister checks before
+///         accepting it.
 interface IVedaStackFactoryWiring {
     function authorizer() external view returns (address);
+    function tellerLister() external view returns (address);
     function registry() external view returns (address);
 }

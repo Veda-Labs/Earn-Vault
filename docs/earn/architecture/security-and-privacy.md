@@ -90,7 +90,7 @@ An engine setup owner binds the EarnVault once and may transfer ownership to the
 same call. After binding, only the EarnVault can deposit, redeem, withdraw, queue, or cancel against
 the engine's venue position. Final-owner powers are engine-specific; Veda's owner, registry, and
 forwarding-solver authorities are in [Veda](../modules/veda.md#contracts), and those of a stack built by
-`VedaStackFactory`, with the factory's operator and the role granter, in
+`VedaStackFactory`, with the factory's operator, the role granter and the Teller lister, in
 [Veda shared-vault stacks](../modules/veda-shared-stacks.md#trust-and-failure-modes).
 
 ### Earn router

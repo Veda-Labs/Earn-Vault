@@ -2,7 +2,11 @@
 pragma solidity ^0.8.36;
 
 import { IEarnVault } from "../../../../interfaces/earn/IEarnVault.sol";
-import { IVedaStackAuthorizer, IVedaVaultRegistry } from "../../../../interfaces/earn/engines/IVedaVaultRegistry.sol";
+import {
+    IVedaStackAuthorizer,
+    IVedaTellerLister,
+    IVedaVaultRegistry
+} from "../../../../interfaces/earn/engines/IVedaVaultRegistry.sol";
 import { ITIP403PolicyCreator } from "../../../../interfaces/external/tempo/ITIP403PolicyCreator.sol";
 import {
     TIP403_REGISTRY_ADDRESS,
@@ -18,19 +22,22 @@ import { EarnVault } from "../../../core/EarnVault.sol";
 import { VedaForwardingSolver } from "../VedaForwardingSolver.sol";
 import { VedaLockstepEngine } from "./VedaLockstepEngine.sol";
 import { VedaForwardingSolverDeployer, VedaLockstepEngineDeployer } from "./VedaStackDeployers.sol";
+import { VedaTellerAllowlist } from "./VedaTellerAllowlist.sol";
 
 /// @title VedaStackFactory
 /// @notice Builds complete Earn stacks on one BoringVault without a transaction from the vault's
 ///         administrator. One operator call deploys a {VedaLockstepEngine}, creates its EarnVault,
 ///         EarnShare and EarnFees through the canonical `EarnFactory`, deploys a forwarding solver when
-///         the vault has a Queue, binds the engine, authorizes it, and records the stack.
+///         the vault has a Queue, binds the engine, authorizes it, lists it on a Teller that admits by
+///         account, and records the stack.
 ///
 /// @dev WHAT THE VAULT'S ADMINISTRATOR TRUSTS, ONCE. The administrator names this factory on its
 ///      `authorizer` (a {VedaRoleGranter}, or a {VedaVaultAccessRegistry} behind a
-///      {VedaAuthorityOverlay}), having reviewed this contract's code and wiring: an authorizer checks
-///      only that a factory reports the right registry and authorizer. From then on this contract
-///      decides which addresses receive the engine and forwarder authorization, so it gives them only
-///      to contracts it built itself:
+///      {VedaAuthorityOverlay}) and on its `tellerLister` (a {VedaTellerLister}), whichever of the two
+///      the vault needs, having reviewed this contract's code and wiring: each checks only that a
+///      factory reports the right registry and itself. From then on this contract decides which
+///      addresses receive the engine and forwarder authorization and a place on the Teller's list, so
+///      it gives them only to contracts it built itself:
 ///      - an engine comes from the pinned engine deployer in this contract's own call, is owned by this
 ///        contract until it is bound, and is bound to the EarnVault the pinned `EarnFactory` just
 ///        produced for it. A canonical engine lets its owner bind any EarnVault, so checking an
@@ -64,10 +71,11 @@ import { VedaForwardingSolverDeployer, VedaLockstepEngineDeployer } from "./Veda
 ///      `StackCreated` say which stacks this factory built.
 ///
 ///      THE RECORDS ARE NOT THE PERMISSIONS. A status here says what this factory last did. The vault's
-///      administrator can change a permission directly, and a function the vault lets anyone call
-///      stays callable by a revoked engine.
+///      administrator can change a permission or the Teller's list directly, and a function the vault
+///      lets anyone call stays callable by a revoked engine unless the Teller's list is what admits
+///      it. {isEngineReady} reads the published modules live.
 /// The factory's wiring never changes.
-/// @custom:invariant address(registry) != address(0) && address(authorizer) != address(0)
+/// @custom:invariant address(registry) != address(0)
 /// @custom:invariant address(earnFactory) != address(0) && forwarderOwner != address(0)
 /// Mutating entry points are nonReentrant through the transient `_entered` flag.
 /// @custom:reentrancy-guard _entered
@@ -90,6 +98,7 @@ contract VedaStackFactory {
     struct Config {
         IVedaVaultRegistry registry;
         IVedaStackAuthorizer authorizer;
+        IVedaTellerLister tellerLister;
         EarnFactory earnFactory;
         bytes32 earnFactoryCodeHash;
         VedaLockstepEngineDeployer engineDeployer;
@@ -127,7 +136,11 @@ contract VedaStackFactory {
     /// @notice The vault's registry: its modules, and who administers the vault.
     IVedaVaultRegistry public immutable registry;
     /// @notice Where this factory records an authorization: the role granter or the access registry.
+    ///         Zero when the vault lets its engines and forwarding solvers call without one.
     IVedaStackAuthorizer public immutable authorizer;
+    /// @notice What puts this factory's engines on the Teller's account allowlist. Zero when the vault's
+    ///         Teller has no allowlist, or when engines are listed some other way before they are bound.
+    IVedaTellerLister public immutable tellerLister;
     /// @notice The canonical core factory, pinned by address and by the code hash named at construction.
     EarnFactory public immutable earnFactory;
     bytes32 public immutable earnFactoryCodeHash;
@@ -165,6 +178,9 @@ contract VedaStackFactory {
     );
     event ForwarderDeployed(address indexed forwarder, address indexed engine, address queue, address solver);
     event EngineAuthorizationChanged(address indexed engine, bool authorized, address indexed by);
+    /// @notice A revocation removed one of the engine's two gates and not `gate`: the authorizer, whose
+    ///         call reverted, or the Teller lister, whose Teller did not take the change.
+    event EngineRevocationIncomplete(address indexed engine, address indexed gate);
     event ForwarderAuthorizationChanged(address indexed forwarder, bool authorized, address indexed by);
     event RegistrationsPauseChanged(bool paused, address indexed by);
     event OperatorChanged(address indexed oldOperator, address indexed newOperator);
@@ -185,12 +201,14 @@ contract VedaStackFactory {
     error InvalidForwarderDeployment(address forwarder);
     error InvalidTransferPolicyAdmin(address admin);
     error NotAuthorizedOnVeda(address account, address target, bytes4 functionSig);
+    error NotListedOnTeller(address engine, address teller);
     error NotOperator(address caller);
     error NotPauser(address caller);
     error NotVaultAdmin(address caller);
     error QueueUnavailable();
     error ReentrantCall();
     error RegistrationsPaused();
+    error RevocationFailed(address account);
     error UnexpectedEarnVaultEngine(address earnVault, address expected, address actual);
     error ZeroAddress();
 
@@ -226,13 +244,15 @@ contract VedaStackFactory {
 
     constructor(Config memory config) {
         if (
-            address(config.registry) == address(0) || address(config.authorizer) == address(0)
-                || address(config.earnFactory) == address(0) || address(config.engineDeployer) == address(0)
-                || address(config.forwarderDeployer) == address(0) || config.forwarderOwner == address(0)
-                || config.forwarderTreasury == address(0) || config.operator == address(0)
+            address(config.registry) == address(0) || address(config.earnFactory) == address(0)
+                || address(config.engineDeployer) == address(0) || address(config.forwarderDeployer) == address(0)
+                || config.forwarderOwner == address(0) || config.forwarderTreasury == address(0)
+                || config.operator == address(0)
         ) revert ZeroAddress();
         _requireCode(address(config.registry));
-        _requireCode(address(config.authorizer));
+        // Either may be absent: a vault can gate its engines by role, by the Teller's list, or by both.
+        if (address(config.authorizer) != address(0)) _requireCode(address(config.authorizer));
+        if (address(config.tellerLister) != address(0)) _requireCode(address(config.tellerLister));
         // Each pinned contract is named by address and by the code hash its deployer states, which is
         // what a reviewer compares with the release. The hashes cannot be wrong for these addresses.
         _requireCodeHash(address(config.earnFactory), config.earnFactoryCodeHash);
@@ -241,6 +261,7 @@ contract VedaStackFactory {
 
         registry = config.registry;
         authorizer = config.authorizer;
+        tellerLister = config.tellerLister;
         earnFactory = config.earnFactory;
         earnFactoryCodeHash = config.earnFactoryCodeHash;
         engineDeployer = config.engineDeployer;
@@ -318,22 +339,52 @@ contract VedaStackFactory {
     // Pausers: reduce
     // ------------------------------------------------------------------
 
-    /// @notice Takes an engine's authorization away: its deposits and immediate exits stop until the
-    ///         vault's administrator reinstates it, and so do its new queued requests and cancellations
-    ///         unless the vault lets anyone call those. Requests already queued can still be settled.
+    /// @notice Takes an engine's authorization and its place on the Teller's list away: its deposits
+    ///         and immediate exits stop until the vault's administrator reinstates it, and so do its new
+    ///         queued requests and cancellations unless the vault lets anyone call those. Requests
+    ///         already queued can still be settled, except on a Queue that applies the Teller's list,
+    ///         which settles nothing for a delisted engine and lets a waiting request pass its deadline.
     ///         For incidents only: the stack's users cannot exit instantly while it lasts.
+    /// @dev The authorization and the listing are removed independently, so that one that cannot be
+    ///      removed never keeps the other in place, and `EngineRevocationIncomplete` names a gate that
+    ///      was not removed. A lister that accepts the call records the engine as delisted even when
+    ///      the Teller does not take the change, so the revocation stands and anyone can finish it
+    ///      there. The call reverts only when nothing was removed or recorded: with the authorizer's
+    ///      own reason when it gave one. Where the vault lets anyone call the Teller, an engine stays
+    ///      usable until its listing is actually gone, and with no lister it keeps working.
     function revokeEngine(address engine) external onlyPauser nonReentrant {
         StackRecord storage record = _stacks[engine];
         if (record.status != EngineStatus.Active) revert EngineNotActive(engine);
         record.status = EngineStatus.Revoked;
-        authorizer.setEngineAuthorized(engine, false);
+
+        bool recorded;
+        if (address(tellerLister) != address(0)) {
+            try tellerLister.setEngineListed(engine, false) returns (bool applied) {
+                recorded = true;
+                if (!applied) emit EngineRevocationIncomplete(engine, address(tellerLister));
+            } catch {
+                emit EngineRevocationIncomplete(engine, address(tellerLister));
+            }
+        }
+        if (address(authorizer) != address(0)) {
+            try authorizer.setEngineAuthorized(engine, false) {
+                recorded = true;
+            } catch (bytes memory reason) {
+                // With nothing else removed, this is the reason the revocation failed.
+                if (!recorded) _revertWith(reason);
+                emit EngineRevocationIncomplete(engine, address(authorizer));
+            }
+        }
+        if (!recorded) revert RevocationFailed(engine);
         emit EngineAuthorizationChanged(engine, false, msg.sender);
     }
 
     /// @notice Takes a forwarding solver's authorization away, so it can no longer drive the stock solver.
+    /// @dev Reverts on a factory without an authorizer, which granted the forwarder nothing to take away.
     function revokeForwarder(address forwarder) external onlyPauser nonReentrant {
         ForwarderRecord storage record = _forwarders[forwarder];
         if (record.status != ForwarderStatus.Active) revert ForwarderNotActive(forwarder);
+        if (address(authorizer) == address(0)) revert RevocationFailed(forwarder);
         record.status = ForwarderStatus.Revoked;
         authorizer.setForwarderAuthorized(forwarder, false);
         emit ForwarderAuthorizationChanged(forwarder, false, msg.sender);
@@ -403,10 +454,23 @@ contract VedaStackFactory {
         return _engines[index];
     }
 
-    /// @notice Whether the vault's administrator has named this factory on the authorizer.
-    ///         Stack-building reverts while it has not.
+    /// @notice Whether the vault's administrator has named this factory on its authorizer and on its
+    ///         Teller lister, whichever of them it has. Stack-building reverts while it has not.
     function isAuthorizerBound() public view returns (bool) {
-        return authorizer.isFactory(address(this));
+        return (address(authorizer) == address(0) || authorizer.isFactory(address(this)))
+            && (address(tellerLister) == address(0) || tellerLister.isFactory(address(this)));
+    }
+
+    /// @notice Whether `engine` is an active stack of this factory that the vault's published modules
+    ///         would serve right now: allowed to call them, and admitted by the Teller's list.
+    /// @dev Read live, unlike a stack's status, which only says what this factory last did. A Teller
+    ///      whose list is not enforced, or cannot be read, admits every account. It does not cover a
+    ///      paused Teller, a deposit cap, the stack's own EarnVault controls, or whether the Queue
+    ///      applies the Teller's list.
+    function isEngineReady(address engine) external view returns (bool) {
+        if (_stacks[engine].status != EngineStatus.Active) return false;
+        (address target,) = _firstRefusedCall(engine);
+        return target == address(0) && _isListed(engine, address(registry.teller()));
     }
 
     // ------------------------------------------------------------------
@@ -506,25 +570,50 @@ contract VedaStackFactory {
         emit ForwarderDeployed(forwarder, engine, address(queue), address(solver));
     }
 
-    /// @dev Authorizes an engine and proves the authorization works: the engine must now be allowed on
+    /// @dev Authorizes and lists an engine, then proves both worked: the engine must now be allowed on
     ///      the published Teller's bulk paths and, when the vault has a Queue, on its request and
-    ///      cancellation. A stack whose permissions are not in place is never reported as built.
+    ///      cancellation, and a Teller that checks accounts must have the engine on its list. A stack
+    ///      whose permissions are not in place is never reported as built.
     function _authorizeEngine(address engine) private {
-        authorizer.setEngineAuthorized(engine, true);
+        if (address(authorizer) != address(0)) authorizer.setEngineAuthorized(engine, true);
+        if (address(tellerLister) != address(0)) tellerLister.setEngineListed(engine, true);
+
+        (address target, bytes4 functionSig) = _firstRefusedCall(engine);
+        if (target != address(0)) revert NotAuthorizedOnVeda(engine, target, functionSig);
         address teller = address(registry.teller());
-        _requireCanCall(engine, teller, ITeller.bulkDeposit.selector);
-        _requireCanCall(engine, teller, ITeller.bulkWithdraw.selector);
+        if (!_isListed(engine, teller)) revert NotListedOnTeller(engine, teller);
+        emit EngineAuthorizationChanged(engine, true, msg.sender);
+    }
+
+    /// @dev The first of an engine's calls on the published modules that the module's own authority
+    ///      refuses, or zero when it allows them all. Where a function is open to everyone this proves
+    ///      nothing about the engine, which is why {_isListed} is checked beside it.
+    function _firstRefusedCall(address engine) private view returns (address target, bytes4 functionSig) {
+        address teller = address(registry.teller());
+        if (!_canCall(engine, teller, ITeller.bulkDeposit.selector)) return (teller, ITeller.bulkDeposit.selector);
+        if (!_canCall(engine, teller, ITeller.bulkWithdraw.selector)) return (teller, ITeller.bulkWithdraw.selector);
         address queue = address(registry.queue());
         if (queue != address(0)) {
-            _requireCanCall(engine, queue, IBoringQueue.requestOnChainWithdraw.selector);
-            _requireCanCall(engine, queue, IBoringQueue.cancelOnChainWithdrawUsingRequestId.selector);
+            if (!_canCall(engine, queue, IBoringQueue.requestOnChainWithdraw.selector)) {
+                return (queue, IBoringQueue.requestOnChainWithdraw.selector);
+            }
+            if (!_canCall(engine, queue, IBoringQueue.cancelOnChainWithdrawUsingRequestId.selector)) {
+                return (queue, IBoringQueue.cancelOnChainWithdrawUsingRequestId.selector);
+            }
         }
-        emit EngineAuthorizationChanged(engine, true, msg.sender);
+    }
+
+    /// @dev Whether the Teller's account allowlist admits `engine` as a share recipient and as a share
+    ///      owner. A Teller without an allowlist admits every account.
+    function _isListed(address engine, address teller) private view returns (bool) {
+        (bool depositChecked, bool depositAllowed) = VedaTellerAllowlist.tryIsDepositAllowed(teller, engine);
+        (bool withdrawChecked, bool withdrawAllowed) = VedaTellerAllowlist.tryIsWithdrawAllowed(teller, engine);
+        return (!depositChecked || depositAllowed) && (!withdrawChecked || withdrawAllowed);
     }
 
     /// @dev Authorizes a forwarding solver this factory built and proves it may drive its stock solver.
     function _authorizeForwarder(address forwarder) private {
-        authorizer.setForwarderAuthorized(forwarder, true);
+        if (address(authorizer) != address(0)) authorizer.setForwarderAuthorized(forwarder, true);
         _requireCanCall(
             forwarder, address(VedaForwardingSolver(forwarder).boringSolver()), IBoringSolver.boringRedeemSolve.selector
         );
@@ -532,9 +621,18 @@ contract VedaStackFactory {
     }
 
     function _requireCanCall(address account, address target, bytes4 functionSig) private view {
+        if (!_canCall(account, target, functionSig)) revert NotAuthorizedOnVeda(account, target, functionSig);
+    }
+
+    function _canCall(address account, address target, bytes4 functionSig) private view returns (bool) {
         address authority = IAuth(target).authority();
-        if (authority.code.length == 0 || !IAuthority(authority).canCall(account, target, functionSig)) {
-            revert NotAuthorizedOnVeda(account, target, functionSig);
+        return authority.code.length != 0 && IAuthority(authority).canCall(account, target, functionSig);
+    }
+
+    /// @dev Reverts with `reason` as the callee gave it.
+    function _revertWith(bytes memory reason) private pure {
+        assembly ("memory-safe") {
+            revert(add(reason, 0x20), mload(reason))
         }
     }
 

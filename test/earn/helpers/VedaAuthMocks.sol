@@ -190,6 +190,7 @@ contract AuthedTeller is MockAuth {
         requiresAuth
         returns (uint256 shares)
     {
+        _beforeDeposit(to);
         bulkDepositCalls++;
         shares = depositAmount * (10 ** uint256(vault.decimals()))
             / IRateSource(accountant).getRateInQuoteSafe(depositAsset);
@@ -202,11 +203,58 @@ contract AuthedTeller is MockAuth {
         requiresAuth
         returns (uint256 assetsOut)
     {
+        _beforeWithdraw(msg.sender);
         bulkWithdrawCalls++;
         assetsOut =
             shareAmount * IRateSource(accountant).getRateInQuoteSafe(withdrawAsset) / (10 ** uint256(vault.decimals()));
         require(assetsOut >= minimumAssets, "MIN_ASSETS");
         vault.exit(to, withdrawAsset, assetsOut, msg.sender, shareAmount);
+    }
+
+    /// @dev What the Teller checks about the account receiving shares, whoever calls.
+    function _beforeDeposit(address shareRecipient) internal view virtual { }
+
+    /// @dev What the Teller checks about the account whose shares are redeemed.
+    function _beforeWithdraw(address shareOwner) internal view virtual { }
+}
+
+/// @dev Teller with an account allowlist, as Veda's Base V0.3 Teller keeps one: independent of who may
+///      call, a deposit needs its share recipient on the list and a withdrawal its share owner, each
+///      only while that direction is enforced. Both directions start unenforced.
+contract AllowlistTeller is AuthedTeller {
+    bool public depositAllowlistEnabled;
+    bool public withdrawAllowlistEnabled;
+    mapping(address => bool) public allowedAccounts;
+
+    constructor(address owner_, address authority_, AuthedBoringVault vault_, address accountant_)
+        AuthedTeller(owner_, authority_, vault_, accountant_)
+    { }
+
+    function setAllowlistEnabled(bool deposits, bool withdraws) external requiresAuth {
+        depositAllowlistEnabled = deposits;
+        withdrawAllowlistEnabled = withdraws;
+    }
+
+    function setAllowedAccounts(address[] calldata accounts, bool allowed) external requiresAuth {
+        for (uint256 i = 0; i < accounts.length; i++) {
+            allowedAccounts[accounts[i]] = allowed;
+        }
+    }
+
+    function isDepositAllowed(address account) public view returns (bool) {
+        return !depositAllowlistEnabled || allowedAccounts[account];
+    }
+
+    function isWithdrawAllowed(address account) public view returns (bool) {
+        return !withdrawAllowlistEnabled || allowedAccounts[account];
+    }
+
+    function _beforeDeposit(address shareRecipient) internal view override {
+        require(isDepositAllowed(shareRecipient), "NOT_ALLOWED");
+    }
+
+    function _beforeWithdraw(address shareOwner) internal view override {
+        require(isWithdrawAllowed(shareOwner), "NOT_ALLOWED");
     }
 }
 
@@ -242,6 +290,7 @@ contract AuthedQueue is MockAuth {
         requiresAuth
         returns (bytes32 requestId)
     {
+        _checkAccount(msg.sender);
         require(boringVault.transferFrom(msg.sender, address(this), shares), "PULL");
         OnChainWithdraw memory request = OnChainWithdraw({
             nonce: nonce++,
@@ -280,6 +329,7 @@ contract AuthedQueue is MockAuth {
         uint256 requiredAssets;
         for (uint256 i = 0; i < requests.length; i++) {
             bytes32 requestId = keccak256(abi.encode(requests[i]));
+            _checkAccount(requests[i].user);
             require(isActive[requestId], "REQUEST");
             require(requests[i].assetOut == solveAsset, "ASSET");
             isActive[requestId] = false;
@@ -306,6 +356,32 @@ contract AuthedQueue is MockAuth {
     function getOnChainWithdraw(bytes32 requestId) public view returns (OnChainWithdraw memory request) {
         request = _requests[requestId];
         require(request.nonce != 0, "REQUEST");
+    }
+
+    /// @dev What the Queue checks about a request's owner when the request is filed and when it is
+    ///      settled. Cancellation is never checked.
+    function _checkAccount(address requestOwner) internal view virtual { }
+}
+
+interface IWithdrawAllowlist {
+    function isWithdrawAllowed(address account) external view returns (bool);
+}
+
+/// @dev Queue that applies a Teller's withdrawal allowlist to every request's owner, as Veda's does
+///      once `setTeller` names one. A zero Teller checks nothing.
+contract AllowlistQueue is AuthedQueue {
+    address public teller;
+
+    constructor(address owner_, address authority_, AuthedBoringVault vault_, address accountant_)
+        AuthedQueue(owner_, authority_, vault_, accountant_)
+    { }
+
+    function setTeller(address newTeller) external requiresAuth {
+        teller = newTeller;
+    }
+
+    function _checkAccount(address requestOwner) internal view override {
+        require(teller == address(0) || IWithdrawAllowlist(teller).isWithdrawAllowed(requestOwner), "NOT_ALLOWED");
     }
 }
 

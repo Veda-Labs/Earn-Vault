@@ -2,12 +2,17 @@
 pragma solidity ^0.8.36;
 
 // Gas of building a stack through VedaStackFactory, in one call and in two, with each authorization
-// variant. Run under the Tempo hardfork to read it against Tempo's per-transaction gas cap:
+// variant and on a vault whose Teller keeps an account allowlist. Run under the Tempo hardfork to read it against Tempo's per-transaction gas cap:
 //   FOUNDRY_PROFILE=spend forge test --match-path test/earn/gas/VedaStackGas.t.sol --no-match-path none -vv
 // forge-lint: disable-start(multi-contract-file)
 import { console2 } from "forge-std/Test.sol";
-import { AuthedQueue, AuthedSolver } from "../helpers/VedaAuthMocks.sol";
-import { VedaOverlayStackTestBase, VedaRoleStackTestBase, VedaStackTestBase } from "../helpers/VedaStackTestBase.sol";
+import { AuthedQueue, AuthedSolver, AuthedTeller } from "../helpers/VedaAuthMocks.sol";
+import {
+    VedaAllowlistStackTestBase,
+    VedaOverlayStackTestBase,
+    VedaRoleStackTestBase,
+    VedaStackTestBase
+} from "../helpers/VedaStackTestBase.sol";
 
 abstract contract VedaStackGasAudit is VedaStackTestBase {
     bytes32 internal constant STACK = keccak256("gas-stack");
@@ -85,6 +90,29 @@ contract VedaRoleStackGasAudit is VedaRoleStackTestBase, VedaStackGasAudit {
 contract VedaOverlayStackGasAudit is VedaOverlayStackTestBase, VedaStackGasAudit {
     function setUp() public override(VedaStackTestBase) {
         super.setUp();
+    }
+}
+
+/// @dev The role granter for the Queue and the stock solver, plus a Teller lister for the engine.
+contract VedaAllowlistStackGasAudit is VedaAllowlistStackTestBase, VedaStackGasAudit {
+    function setUp() public override(VedaStackTestBase) {
+        super.setUp();
+    }
+
+    function _newTeller() internal override(VedaStackTestBase, VedaAllowlistStackTestBase) returns (AuthedTeller) {
+        return super._newTeller();
+    }
+
+    function _newQueue(address accountant_)
+        internal
+        override(VedaStackTestBase, VedaAllowlistStackTestBase)
+        returns (AuthedQueue)
+    {
+        return super._newQueue(accountant_);
+    }
+
+    function _configureVeda() internal override(VedaStackTestBase, VedaAllowlistStackTestBase) {
+        super._configureVeda();
     }
 }
 // forge-lint: disable-end(multi-contract-file)
