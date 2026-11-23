@@ -404,8 +404,8 @@ runs before handing the vault over. Before that batch, review:
 Both variants:
 
 1. `registry.publish(...)` with the vault's live modules.
-2. Give the vault's pause roles the factory's `revokeEngine`, `revokeForwarder` and
-   `pauseRegistrations`, and the registry's `haltDeposits`.
+2. Give the vault's pause roles the factory's `revokeEngine`, `revokeForwarder`,
+   `pauseRegistrations` and `discardEngine`, and the registry's `haltDeposits`.
 
 Restrict who may call the Teller's `bulkDeposit` to the vault's engines where the vault can, even
 when the Teller also keeps a list: the registry's [deposit halt](#vault-registry) is a stop only

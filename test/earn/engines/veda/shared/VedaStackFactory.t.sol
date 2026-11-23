@@ -414,7 +414,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
             factory.discardEngine(pending);
         }
         // Only an engine that was never bound can be discarded.
-        vm.startPrank(admin);
+        vm.startPrank(pauser);
         vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotPending.selector, address(active)));
         factory.discardEngine(address(active));
         vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotPending.selector, stranger));

@@ -265,6 +265,7 @@ abstract contract VedaStackTestBase is Test {
             rolesAuthority.setRoleCapability(role, address(factory), VedaStackFactory.revokeEngine.selector, true);
             rolesAuthority.setRoleCapability(role, address(factory), VedaStackFactory.revokeForwarder.selector, true);
             rolesAuthority.setRoleCapability(role, address(factory), VedaStackFactory.pauseRegistrations.selector, true);
+            rolesAuthority.setRoleCapability(role, address(factory), VedaStackFactory.discardEngine.selector, true);
             rolesAuthority.setRoleCapability(role, address(registry), VedaVaultRegistry.haltDeposits.selector, true);
         }
     }
