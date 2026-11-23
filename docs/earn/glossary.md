@@ -54,9 +54,11 @@ One line per term; each links to the page that owns it.
 - **Veda, BoringVault, Teller:** Veda's externally owned vault system: the BoringVault issues the
   shares `VedaEngine` holds, the Teller executes deposits and immediate exits, and an optional Queue
   handles queued exits ([Veda engine](modules/veda.md)).
-- **Vault registry, stack factory:** the per-BoringVault publication of its Teller, Queue and
-  Accountant that every `VedaLockstepEngine` reads, and the operator-gated factory that builds and
-  authorizes whole stacks on that vault ([Veda shared-vault stacks](modules/veda-shared-stacks.md)).
+- **Vault registry, stack factory, role granter:** the per-BoringVault publication of its Teller,
+  Queue and Accountant that every `VedaEngine` of that vault is built on, the operator-gated factory
+  that builds whole stacks on it, and the contract that gives what the factory builds its Veda roles
+  and, where the Teller admits by account, its place on the Teller's list
+  ([Veda shared-vault stacks](modules/veda-shared-stacks.md)).
 
 ## Deployment tooling
 

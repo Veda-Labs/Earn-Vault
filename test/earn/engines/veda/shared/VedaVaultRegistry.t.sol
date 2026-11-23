@@ -1,132 +1,51 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.36;
 
-// The per-vault registry: who may publish, and what a publication must satisfy now that no engine
-// re-checks a tuple before using it.
+// The per-vault registry: who may publish, what a publication must satisfy, and how an unmodified
+// `VedaEngine` runs on it: bound through `engine()`, and moved to a later publication only by its owner.
 // forge-lint: disable-start(multi-contract-file)
+import { Test } from "forge-std/Test.sol";
+import { VedaEngine } from "../../../../../src/earn/engines/veda/VedaEngine.sol";
 import { VedaVaultRegistry } from "../../../../../src/earn/engines/veda/shared/VedaVaultRegistry.sol";
 import { IAccountant } from "../../../../../src/interfaces/external/veda/IAccountant.sol";
 import { IBoringQueue } from "../../../../../src/interfaces/external/veda/IBoringQueue.sol";
 import { IBoringSolver } from "../../../../../src/interfaces/external/veda/IBoringSolver.sol";
 import { IBoringVault } from "../../../../../src/interfaces/external/veda/IBoringVault.sol";
 import { ITeller } from "../../../../../src/interfaces/external/veda/ITeller.sol";
+import { IVedaPeripheryRegistry } from "../../../../../src/interfaces/external/veda/IVedaPeripheryRegistry.sol";
 import { AuthedBoringVault, MockRolesAuthority } from "../../../helpers/VedaAuthMocks.sol";
 import {
     MockAccountant,
     MockAsset,
     MockBoringVault,
+    MockCore,
     MockQueue,
     MockTeller
 } from "../../../helpers/VedaEngineMocks.sol";
-import { VedaLockstepEngineTestBase } from "../../../helpers/VedaLockstepEngineTestBase.sol";
 
-/// @dev Step-accounting Accountant: its report time is the eighth word of `accountantState()`.
-contract StepAccountant {
-    address public immutable vault;
-    address public immutable base;
-    uint64 public lastUpdate;
-    uint256 public stateWords = 12;
+/// @dev The mock BoringVault with the authority surface a registry reads: it is its own authority and,
+///      like the local fixture vault, admits every call, so any Teller wired to it can mint and burn.
+contract PermissiveBoringVault is MockBoringVault {
+    constructor(address asset_, uint8 decimals_) MockBoringVault(asset_, decimals_) { }
 
-    constructor(address vault_, address base_) {
-        vault = vault_;
-        base = base_;
-        lastUpdate = uint64(block.timestamp);
+    function authority() external view returns (address) {
+        return address(this);
     }
 
-    function setLastUpdate(uint64 lastUpdate_) external {
-        lastUpdate = lastUpdate_;
-    }
-
-    function setStateWords(uint256 stateWords_) external {
-        stateWords = stateWords_;
-    }
-
-    function getRate() external pure returns (uint256) {
-        return 1e6;
-    }
-
-    function getRateInQuoteSafe(address) external pure returns (uint256) {
-        return 1e6;
-    }
-
-    function accountantState() external view returns (bytes memory) {
-        uint256 words = stateWords;
-        uint256 updatedAt = lastUpdate;
-        assembly ("memory-safe") {
-            let ptr := mload(0x40)
-            calldatacopy(ptr, calldatasize(), mul(words, 0x20))
-            mstore(add(ptr, 0xe0), updatedAt)
-            return(ptr, mul(words, 0x20))
-        }
+    function canCall(address, address, bytes4) external pure returns (bool) {
+        return true;
     }
 }
 
-/// @dev A step-accounting tuple of the right length whose `dirtyField` holds a value outside its type.
-contract DirtyStepAccountant {
-    address public immutable vault;
-    address public immutable base;
-    uint256 private immutable _dirtyField;
-
-    constructor(address vault_, address base_, uint256 dirtyField_) {
-        vault = vault_;
-        base = base_;
-        _dirtyField = dirtyField_;
-    }
-
-    function getRateInQuoteSafe(address) external pure returns (uint256) {
-        return 1e6;
-    }
-
-    function accountantState() external view returns (bytes memory) {
-        uint256 dirtyField = _dirtyField;
-        uint256 updatedAt = block.timestamp;
-        assembly ("memory-safe") {
-            let ptr := mload(0x40)
-            calldatacopy(ptr, calldatasize(), 0x180)
-            mstore(add(ptr, 0xe0), updatedAt)
-            // The top bit is outside every field's type, the timestamp's included.
-            mstore(add(ptr, mul(dirtyField, 0x20)), or(mload(add(ptr, mul(dirtyField, 0x20))), shl(255, 1)))
-            return(ptr, 0x180)
-        }
-    }
+/// @dev Stands in for a Queue's stock solver where a test never solves through it.
+contract MockStockSolver {
+    function boringRedeemSolve(bytes calldata, address, bool) external pure { }
 }
 
-/// @dev A step-accounting Accountant that answers `accountantState()` with exactly the words it is given.
-contract ShapedStepAccountant {
-    address public immutable vault;
-    address public immutable base;
-    uint256[12] public words;
-
-    constructor(address vault_, address base_) {
-        vault = vault_;
-        base = base_;
-    }
-
-    function setWord(uint256 index, uint256 word) external {
-        words[index] = word;
-    }
-
-    function getRateInQuoteSafe(address) external pure returns (uint256) {
-        return 1e6;
-    }
-
-    function accountantState() external view returns (uint256[12] memory) {
-        return words;
-    }
-}
-
-/// @dev An Accountant with no report-age surface at all.
-contract OpaqueAccountant {
-    address public immutable vault;
-    address public immutable base;
-
-    constructor(address vault_, address base_) {
-        vault = vault_;
-        base = base_;
-    }
-
-    function getRateInQuoteSafe(address) external pure returns (uint256) {
-        return 1e6;
+/// @dev Asks a registry which engine it names, as an engine does before it binds.
+contract EngineAsker {
+    function ask(VedaVaultRegistry registry) external view returns (address) {
+        return registry.engine();
     }
 }
 
@@ -154,55 +73,54 @@ contract DirtyOwnerAuthority {
     }
 }
 
-contract VedaVaultRegistryTest is VedaLockstepEngineTestBase {
+/// @dev This test owns the mock BoringVault, which is its own authority, so it is the vault's
+///      administrator and publishes directly.
+contract VedaVaultRegistryTest is Test {
+    uint64 internal constant MAX_RATE_AGE = 1 days;
+
     address internal stranger = makeAddr("stranger");
+    MockAsset internal asset;
+    MockBoringVault internal vault;
+    MockAccountant internal accountant;
+    MockTeller internal teller;
+    MockQueue internal queue;
+    address internal stockSolver;
+    VedaVaultRegistry internal registry;
 
     event VedaVaultPeripheryPublished(
-        uint64 indexed version,
-        address indexed teller,
-        address indexed queue,
-        address accountant,
-        address solver,
-        uint256 validatedRate
+        uint64 indexed version, address indexed teller, address indexed queue, address accountant, address solver
     );
+
+    function setUp() public {
+        asset = new MockAsset();
+        vault = new PermissiveBoringVault(address(asset), 6);
+        accountant = new MockAccountant(vault, address(asset));
+        teller = new MockTeller(vault, accountant, address(asset));
+        queue = new MockQueue(vault, accountant);
+        stockSolver = address(new MockStockSolver());
+        registry = new VedaVaultRegistry(IBoringVault(address(vault)), address(asset));
+        _publish(teller, queue, accountant);
+    }
 
     // ------------------------------------------------------------------
     // Publication
     // ------------------------------------------------------------------
 
-    function testPublishStoresTheTupleCountsTheVersionAndReportsTheValidatedRate() public {
+    function testPublishStoresTheTupleAndCountsTheVersion() public {
         assertEq(address(registry.vault()), address(vault));
         assertEq(registry.baseAsset(), address(asset));
         assertEq(registry.version(), 1);
         (MockAccountant newAccountant, MockTeller newTeller, MockQueue newQueue) = _newPeriphery(2e6);
 
         vm.expectEmit(true, true, true, true, address(registry));
-        emit VedaVaultPeripheryPublished(
-            2, address(newTeller), address(newQueue), address(newAccountant), stockSolver, 2e6
-        );
-        _publish(newTeller, newQueue, newAccountant, 2e6, 2e6);
+        emit VedaVaultPeripheryPublished(2, address(newTeller), address(newQueue), address(newAccountant), stockSolver);
+        _publish(newTeller, newQueue, newAccountant);
 
         assertEq(address(registry.teller()), address(newTeller));
         assertEq(address(registry.queue()), address(newQueue));
         assertEq(address(registry.accountant()), address(newAccountant));
         assertEq(address(registry.solver()), stockSolver);
         assertEq(registry.version(), 2);
-    }
-
-    function testAPublicationOutsideTheCallersRateBoundsIsRefused() public {
-        (MockAccountant newAccountant, MockTeller newTeller, MockQueue newQueue) = _newPeriphery(2e6);
-
-        vm.expectRevert(abi.encodeWithSelector(VedaVaultRegistry.VedaRateOutOfBounds.selector, 2e6, 1e6, 1_500_000));
-        _publish(newTeller, newQueue, newAccountant, 1e6, 1_500_000);
-        vm.expectRevert(abi.encodeWithSelector(VedaVaultRegistry.VedaRateOutOfBounds.selector, 2e6, 2e6 + 1, 3e6));
-        _publish(newTeller, newQueue, newAccountant, 2e6 + 1, 3e6);
-        vm.expectRevert(abi.encodeWithSelector(VedaVaultRegistry.InvalidVedaRateBounds.selector, 0, 3e6));
-        _publish(newTeller, newQueue, newAccountant, 0, 3e6);
-        vm.expectRevert(abi.encodeWithSelector(VedaVaultRegistry.InvalidVedaRateBounds.selector, 3e6, 2e6));
-        _publish(newTeller, newQueue, newAccountant, 3e6, 2e6);
-
-        assertEq(address(registry.accountant()), address(accountant));
-        assertEq(registry.version(), 1);
     }
 
     function testEveryModuleMustBeWiredToThisVaultAndToEachOther() public {
@@ -215,26 +133,26 @@ contract VedaVaultRegistryTest is VedaLockstepEngineTestBase {
         // Teller on another vault, then on another Accountant.
         MockTeller wrongVaultTeller = new MockTeller(otherVault, accountant, address(asset));
         _expectWiring(address(wrongVaultTeller), address(vault), address(otherVault));
-        _publish(wrongVaultTeller, queue, accountant, 1, type(uint256).max);
+        _publish(wrongVaultTeller, queue, accountant);
         MockTeller wrongAccountantTeller = new MockTeller(vault, otherAccountant, address(asset));
         _expectWiring(address(wrongAccountantTeller), address(accountant), address(otherAccountant));
-        _publish(wrongAccountantTeller, queue, accountant, 1, type(uint256).max);
+        _publish(wrongAccountantTeller, queue, accountant);
 
         // Queue on another vault, then on another Accountant.
         MockQueue wrongVaultQueue = new MockQueue(otherVault, accountant);
         _expectWiring(address(wrongVaultQueue), address(vault), address(otherVault));
-        _publish(teller, wrongVaultQueue, accountant, 1, type(uint256).max);
+        _publish(teller, wrongVaultQueue, accountant);
         MockQueue wrongAccountantQueue = new MockQueue(vault, otherAccountant);
         _expectWiring(address(wrongAccountantQueue), address(accountant), address(otherAccountant));
-        _publish(teller, wrongAccountantQueue, accountant, 1, type(uint256).max);
+        _publish(teller, wrongAccountantQueue, accountant);
 
         // Accountant for another vault, then pricing another asset.
         MockTeller tellerForWrongVault = new MockTeller(vault, wrongVaultAccountant, address(asset));
         _expectWiring(address(wrongVaultAccountant), address(vault), address(otherVault));
-        _publish(tellerForWrongVault, MockQueue(address(0)), wrongVaultAccountant, 1, type(uint256).max);
+        _publish(tellerForWrongVault, MockQueue(address(0)), wrongVaultAccountant);
         MockTeller tellerForWrongBase = new MockTeller(vault, wrongBase, address(asset));
         _expectWiring(address(wrongBase), address(asset), address(otherAsset));
-        _publish(tellerForWrongBase, MockQueue(address(0)), wrongBase, 1, type(uint256).max);
+        _publish(tellerForWrongBase, MockQueue(address(0)), wrongBase);
 
         assertEq(registry.version(), 1);
     }
@@ -280,73 +198,12 @@ contract VedaVaultRegistryTest is VedaLockstepEngineTestBase {
         (MockAccountant newAccountant, MockTeller newTeller, MockQueue newQueue) = _newPeriphery(1e6);
         newQueue.setTrackWithdrawsOnChain(false);
         vm.expectRevert(abi.encodeWithSelector(VedaVaultRegistry.QueueTrackingDisabled.selector, address(newQueue)));
-        _publish(newTeller, newQueue, newAccountant, 1, type(uint256).max);
-    }
-
-    function testAnAccountantWhoseReportAgeCannotBeReadOrIsNotSaneIsRefused() public {
-        // Every engine reads the report age before a deposit, so an unreadable one would stop them all.
-        OpaqueAccountant opaque = new OpaqueAccountant(address(vault), address(asset));
-        MockTeller opaqueTeller = new MockTeller(vault, MockAccountant(address(opaque)), address(asset));
-        vm.expectRevert(
-            abi.encodeWithSelector(VedaVaultRegistry.UnsupportedAccountantFreshness.selector, address(opaque))
-        );
-        _publishRaw(address(opaqueTeller), address(0), address(opaque), address(0));
-
-        (MockAccountant newAccountant, MockTeller newTeller, MockQueue newQueue) = _newPeriphery(1e6);
-        newAccountant.setLastStrategistUpdateTimestamp(0);
-        vm.expectRevert(abi.encodeWithSelector(VedaVaultRegistry.InvalidRateTimestamp.selector, 0, block.timestamp));
-        _publish(newTeller, newQueue, newAccountant, 1, type(uint256).max);
-
-        newAccountant.setLastStrategistUpdateTimestamp(uint64(block.timestamp + 1));
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                VedaVaultRegistry.InvalidRateTimestamp.selector, block.timestamp + 1, block.timestamp
-            )
-        );
-        _publish(newTeller, newQueue, newAccountant, 1, type(uint256).max);
-    }
-
-    function testAStepAccountingAccountantIsAcceptedThroughItsStateTuple() public {
-        StepAccountant step = new StepAccountant(address(vault), address(asset));
-        MockTeller stepTeller = new MockTeller(vault, MockAccountant(address(step)), address(asset));
-        _publishRaw(address(stepTeller), address(0), address(step), address(0));
-        assertEq(address(registry.accountant()), address(step));
-
-        // A tuple of another shape is not that Accountant.
-        StepAccountant truncated = new StepAccountant(address(vault), address(asset));
-        truncated.setStateWords(11);
-        MockTeller truncatedTeller = new MockTeller(vault, MockAccountant(address(truncated)), address(asset));
-        vm.expectRevert(
-            abi.encodeWithSelector(VedaVaultRegistry.UnsupportedAccountantFreshness.selector, address(truncated))
-        );
-        _publishRaw(address(truncatedTeller), address(0), address(truncated), address(0));
-
-        StepAccountant unreported = new StepAccountant(address(vault), address(asset));
-        unreported.setLastUpdate(0);
-        MockTeller unreportedTeller = new MockTeller(vault, MockAccountant(address(unreported)), address(asset));
-        vm.expectRevert(abi.encodeWithSelector(VedaVaultRegistry.InvalidRateTimestamp.selector, 0, block.timestamp));
-        _publishRaw(address(unreportedTeller), address(0), address(unreported), address(0));
-    }
-
-    function testAReportOlderThanTheCallerAllowsIsRefused() public {
-        // Every engine would refuse deposits against it, so the publication is refused instead.
-        (MockAccountant newAccountant, MockTeller newTeller, MockQueue newQueue) = _newPeriphery(1e6);
-        uint64 reportedAt = newAccountant.lastStrategistUpdateTimestamp();
-        vm.warp(uint256(reportedAt) + 2 hours + 1);
-
-        vm.expectRevert(
-            abi.encodeWithSelector(VedaVaultRegistry.StaleAccountantRate.selector, reportedAt, block.timestamp, 2 hours)
-        );
-        _publishAged(newTeller, newQueue, newAccountant, 2 hours);
-        vm.expectRevert(VedaVaultRegistry.InvalidMaxReportAge.selector);
-        _publishAged(newTeller, newQueue, newAccountant, 0);
-
-        _publishAged(newTeller, newQueue, newAccountant, 2 hours + 1);
-        assertEq(address(registry.accountant()), address(newAccountant));
+        _publish(newTeller, newQueue, newAccountant);
     }
 
     function testATellerThatCannotMintAndBurnTheVaultsSharesIsRefused() public {
-        // One such Teller would stop every stack's deposits and exits in the same block.
+        // An engine does not check this before it activates a tuple, and one that activated such a
+        // Teller could neither deposit nor exit.
         address timelock = makeAddr("timelock");
         MockRolesAuthority rolesAuthority = new MockRolesAuthority(timelock, address(0));
         AuthedBoringVault authedVault = new AuthedBoringVault(address(0), address(rolesAuthority), 6);
@@ -411,51 +268,72 @@ contract VedaVaultRegistryTest is VedaLockstepEngineTestBase {
         }
     }
 
-    function testAStateTupleWithAMalformedFieldIsNotAStepAccountant() public {
-        // Any field outside its type's range fails a typed decode of the tuple, so it is refused here too.
-        for (uint256 field = 0; field < 12; field++) {
-            DirtyStepAccountant dirty = new DirtyStepAccountant(address(vault), address(asset), field);
-            MockTeller dirtyTeller = new MockTeller(vault, MockAccountant(address(dirty)), address(asset));
-            vm.expectRevert(
-                abi.encodeWithSelector(VedaVaultRegistry.UnsupportedAccountantFreshness.selector, address(dirty))
-            );
-            _publishRaw(address(dirtyTeller), address(0), address(dirty), address(0));
-        }
+    // ------------------------------------------------------------------
+    // The engines it serves
+    // ------------------------------------------------------------------
+
+    function testItNamesEveryCallerAsItsEngineSoAnUnmodifiedEngineBinds() public {
+        // A `VedaEngine` binds only when its registry names it. This registry picks no engine: it
+        // answers each caller with the caller's own address.
+        EngineAsker first = new EngineAsker();
+        EngineAsker second = new EngineAsker();
+        assertEq(first.ask(registry), address(first));
+        assertEq(second.ask(registry), address(second));
+        vm.prank(stranger);
+        assertEq(registry.engine(), stranger);
+
+        // So any number of released engines bind on the one registry, each to its own EarnVault.
+        (VedaEngine engineA, MockCore coreA) = _bindEngine();
+        (VedaEngine engineB, MockCore coreB) = _bindEngine();
+        assertEq(address(engineA.peripheryRegistry()), address(registry));
+        assertEq(engineA.earnVault(), address(coreA));
+        assertEq(engineB.earnVault(), address(coreB));
+        assertEq(address(engineA.teller()), address(teller));
+        assertEq(address(engineA.queue()), address(queue));
+        assertEq(address(engineA.accountant()), address(accountant));
+        assertEq(engineA.peripheryVersion(), 1);
+
+        asset.mint(address(coreA), 10e6);
+        assertEq(coreA.deposit(10e6), 10e6);
+        assertEq(vault.balanceOf(address(engineA)), 10e6);
+        assertEq(vault.balanceOf(address(engineB)), 0);
     }
 
-    function testEveryStateFieldIsAcceptedUpToItsTypesMaximumAndNoFurther() public {
-        // AccountantState, field for field. A table one bit too narrow would refuse a real Accountant,
-        // and one bit too wide would accept a tuple a typed decode rejects.
-        uint8[12] memory fieldBits = [160, 96, 128, 128, 96, 16, 16, 64, 1, 24, 16, 16];
-        uint256 timestampField = 7;
-        ShapedStepAccountant shaped = new ShapedStepAccountant(address(vault), address(asset));
-        MockTeller shapedTeller = new MockTeller(vault, MockAccountant(address(shaped)), address(asset));
-        for (uint256 i = 0; i < 12; i++) {
-            shaped.setWord(i, i == timestampField ? block.timestamp : (uint256(1) << fieldBits[i]) - 1);
-        }
-        _publishRaw(address(shapedTeller), address(0), address(shaped), address(0));
-        assertEq(address(registry.accountant()), address(shaped));
+    function testAPublicationMovesNoEngineUntilItsOwnerActivatesIt() public {
+        (VedaEngine engineA, MockCore coreA) = _bindEngine();
+        (VedaEngine engineB,) = _bindEngine();
+        (MockAccountant newAccountant, MockTeller newTeller, MockQueue newQueue) = _newPeriphery(2e6);
+        _publish(newTeller, newQueue, newAccountant);
 
-        // The timestamp at its own maximum is still a well-formed tuple: refused as a future report,
-        // not as an unreadable one.
-        shaped.setWord(timestampField, type(uint64).max);
-        vm.expectRevert(
-            abi.encodeWithSelector(VedaVaultRegistry.InvalidRateTimestamp.selector, type(uint64).max, block.timestamp)
-        );
-        _publishRaw(address(shapedTeller), address(0), address(shaped), address(0));
-        shaped.setWord(timestampField, block.timestamp);
+        // Both engines keep the tuple they were built on.
+        assertEq(address(engineA.teller()), address(teller));
+        assertEq(address(engineB.teller()), address(teller));
+        assertEq(engineA.peripheryVersion(), 1);
 
-        // One bit beyond any field's type is not.
-        for (uint256 i = 0; i < 12; i++) {
-            uint256 wellFormed = shaped.words(i);
-            shaped.setWord(i, uint256(1) << fieldBits[i]);
-            vm.expectRevert(
-                abi.encodeWithSelector(VedaVaultRegistry.UnsupportedAccountantFreshness.selector, address(shaped))
-            );
-            _publishRaw(address(shapedTeller), address(0), address(shaped), address(0));
-            shaped.setWord(i, wellFormed);
-        }
-        _publishRaw(address(shapedTeller), address(0), address(shaped), address(0));
+        // Activation is the engine's own: its owner, with deposits paused, inside its rate bounds.
+        vm.prank(stranger);
+        vm.expectRevert();
+        engineA.syncVedaPeriphery(1, type(uint256).max);
+        vm.expectRevert(VedaEngine.DepositsNotPaused.selector);
+        engineA.syncVedaPeriphery(1, type(uint256).max);
+        coreA.setDepositsPaused(true);
+        vm.expectRevert(abi.encodeWithSelector(VedaEngine.VedaRateOutOfBounds.selector, 2e6, 1e6, 1_500_000));
+        engineA.syncVedaPeriphery(1e6, 1_500_000);
+        engineA.syncVedaPeriphery(2e6, 2e6);
+
+        assertEq(address(engineA.teller()), address(newTeller));
+        assertEq(address(engineA.queue()), address(newQueue));
+        assertEq(address(engineA.accountant()), address(newAccountant));
+        assertEq(engineA.peripheryVersion(), 2);
+        // The other engine is untouched.
+        assertEq(address(engineB.teller()), address(teller));
+        assertEq(engineB.peripheryVersion(), 1);
+    }
+
+    function testAnEngineIsBuiltOnlyOnARegistryThatHasPublished() public {
+        VedaVaultRegistry empty = new VedaVaultRegistry(IBoringVault(address(vault)), address(asset));
+        vm.expectRevert(VedaEngine.NoPublishedVedaPeriphery.selector);
+        new VedaEngine(IVedaPeripheryRegistry(address(empty)), address(this), MAX_RATE_AGE, "Veda Vault", "vVAULT");
     }
 
     // ------------------------------------------------------------------
@@ -484,10 +362,7 @@ contract VedaVaultRegistryTest is VedaLockstepEngineTestBase {
             ITeller(address(teller)),
             IBoringQueue(address(queue)),
             IAccountant(address(accountant)),
-            IBoringSolver(stockSolver),
-            1,
-            type(uint256).max,
-            MAX_RATE_AGE
+            IBoringSolver(stockSolver)
         );
 
         vault.transferOwnership(stranger);
@@ -553,29 +428,39 @@ contract VedaVaultRegistryTest is VedaLockstepEngineTestBase {
         }
     }
 
-    function _publishAged(MockTeller teller_, MockQueue queue_, MockAccountant accountant_, uint64 maxReportAge)
+    function _newPeriphery(uint256 rate_)
         private
+        returns (MockAccountant newAccountant, MockTeller newTeller, MockQueue newQueue)
     {
+        newAccountant = new MockAccountant(vault, address(asset));
+        newAccountant.setRate(rate_);
+        newTeller = new MockTeller(vault, newAccountant, address(asset));
+        newQueue = new MockQueue(vault, newAccountant);
+    }
+
+    /// @dev A released engine on the shared registry, owned by this test and bound to a fresh core.
+    function _bindEngine() private returns (VedaEngine engine, MockCore core) {
+        engine = new VedaEngine(
+            IVedaPeripheryRegistry(address(registry)), address(this), MAX_RATE_AGE, "Veda Vault", "vVAULT"
+        );
+        core = new MockCore(asset);
+        core.setEngine(engine);
+        engine.initializeEarnVault(address(core));
+    }
+
+    /// @dev A zero Queue publishes no stock solver.
+    function _publish(MockTeller newTeller, MockQueue newQueue, MockAccountant newAccountant) private {
         registry.publish(
-            ITeller(address(teller_)),
-            IBoringQueue(address(queue_)),
-            IAccountant(address(accountant_)),
-            IBoringSolver(stockSolver),
-            1,
-            type(uint256).max,
-            maxReportAge
+            ITeller(address(newTeller)),
+            IBoringQueue(address(newQueue)),
+            IAccountant(address(newAccountant)),
+            IBoringSolver(address(newQueue) == address(0) ? address(0) : stockSolver)
         );
     }
 
     function _publishTo(VedaVaultRegistry registry_, address teller_, address accountant_) private {
         registry_.publish(
-            ITeller(teller_),
-            IBoringQueue(address(0)),
-            IAccountant(accountant_),
-            IBoringSolver(address(0)),
-            1,
-            type(uint256).max,
-            MAX_RATE_AGE
+            ITeller(teller_), IBoringQueue(address(0)), IAccountant(accountant_), IBoringSolver(address(0))
         );
     }
 
@@ -586,15 +471,7 @@ contract VedaVaultRegistryTest is VedaLockstepEngineTestBase {
     }
 
     function _publishRaw(address teller_, address queue_, address accountant_, address solver_) private {
-        registry.publish(
-            ITeller(teller_),
-            IBoringQueue(queue_),
-            IAccountant(accountant_),
-            IBoringSolver(solver_),
-            1,
-            type(uint256).max,
-            MAX_RATE_AGE
-        );
+        registry.publish(ITeller(teller_), IBoringQueue(queue_), IAccountant(accountant_), IBoringSolver(solver_));
     }
 }
 // forge-lint: disable-end(multi-contract-file)

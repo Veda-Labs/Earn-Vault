@@ -1,37 +1,36 @@
 # Veda shared-vault stacks
 
 This page owns the contracts that build many Earn stacks on one BoringVault without a transaction
-from the vault's administrator for each stack: `VedaVaultRegistry`, `VedaLockstepEngine`,
-`VedaStackFactory` with its two deployers, the two ways the factory's authorizations reach Veda,
-`VedaRoleGranter` and `VedaAuthorityOverlay` with `VedaVaultAccessRegistry`, `VedaTellerLister` for a
-Teller that admits by account, and `VedaForwarderSteward` for the forwarding solvers' solver list.
-Valuation, immediate and queued exits, request data, and stale reports are the
-[Veda engine](veda.md)'s and are not repeated here.
+from the vault's administrator for each stack: `VedaVaultRegistry`, `VedaStackFactory` with its two
+deployers, `VedaRoleGranter`, which admits what the factory builds, and `VedaForwarderSteward` for
+the forwarding solvers' solver list. Every stack runs the released `VedaEngine` and
+`VedaForwardingSolver`, unmodified. Valuation, immediate and queued exits, request data, periphery
+rotation and stale reports are the [Veda engine](veda.md)'s and are not repeated here.
 
-None of these contracts is audited ([audits](../audit/README.md#scope)). They live beside the
-audited `VedaEngine`, `VedaPeripheryRegistry` and `VedaForwardingSolver`, which are unchanged and
-keep serving the stacks built on them. The profile lifecycle (`pnpm earn`) neither deploys nor
-inspects a stack built here: its Veda inspection reads `VedaEngine`'s per-engine registry, which a
-`VedaLockstepEngine` does not have.
+None of the contracts on this page is audited ([audits](../audit/README.md#scope)). The engine and
+the forwarding solver they deploy are the audited ones. The profile lifecycle (`pnpm earn`) neither
+deploys nor inspects a stack built here: its Veda inspection requires an engine's registry to name
+that one engine, and a `VedaVaultRegistry` [names its caller](#vault-registry).
 
 ## What changes
 
-A `VedaEngine` stack needs the vault's administrator twice: the BoringVault's owner publishes and
-binds a registry for that one engine, and the RolesAuthority's owner gives the engine its role. Here
-the administrator acts once per vault. It publishes the vault's modules in one registry that every
-engine reads, and empowers one factory. After that an operator builds each stack, and the factory
-authorizes only what it built.
+A `VedaEngine` stack needs the vault's administrator twice: the BoringVault's owner deploys, publishes
+and binds a `VedaPeripheryRegistry` for that one engine, and the RolesAuthority's owner gives the
+engine its role. Here the administrator acts once per vault. It publishes the vault's modules in one
+registry that every engine is built on, and empowers one factory. After that an operator builds each
+stack, and the factory has the vault admit only what it built.
 
-| Contract                                                                                                                                                                                 | Count     | Purpose                                                                     |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- | --------------------------------------------------------------------------- |
-| [`VedaVaultRegistry`](../../../src/earn/engines/veda/shared/VedaVaultRegistry.sol)                                                                                                       | Per vault | The vault's Teller, optional Queue with its stock solver, and Accountant    |
-| [`VedaLockstepEngine`](../../../src/earn/engines/veda/shared/VedaLockstepEngine.sol)                                                                                                     | Per stack | `VedaEngine` that reads the registry on every call                          |
-| [`VedaStackFactory`](../../../src/earn/engines/veda/shared/VedaStackFactory.sol)                                                                                                         | Per vault | Operator-gated: builds, binds, authorizes and records a stack               |
-| [`VedaLockstepEngineDeployer`, `VedaForwardingSolverDeployer`](../../../src/earn/engines/veda/shared/VedaStackDeployers.sol)                                                             | Per chain | Hold the engine's and the forwarding solver's creation code for the factory |
-| [`VedaRoleGranter`](../../../src/earn/engines/veda/shared/VedaRoleGranter.sol)                                                                                                           | Per vault | Authorization by RolesAuthority roles (the default)                         |
-| [`VedaAuthorityOverlay`](../../../src/earn/engines/veda/shared/VedaAuthorityOverlay.sol), [`VedaVaultAccessRegistry`](../../../src/earn/engines/veda/shared/VedaVaultAccessRegistry.sol) | Per vault | Authorization by a read-only overlay (the alternative)                      |
-| [`VedaTellerLister`](../../../src/earn/engines/veda/shared/VedaTellerLister.sol)                                                                                                         | Per vault | Lists each engine on a Teller that keeps an account allowlist               |
-| [`VedaForwarderSteward`](../../../src/earn/engines/veda/shared/VedaForwarderSteward.sol)                                                                                                 | Per vault | Owns the forwarding solvers and approves the vault's solvers on each        |
+Nothing else about a stack changes. Its engine caches the Teller, Queue and Accountant published
+when it is built, and its owner activates a later publication with `syncVedaPeriphery`, exactly as in
+[periphery rotation](veda.md#periphery-rotation).
+
+| Contract                                                                                                             | Count     | Purpose                                                                     |
+| -------------------------------------------------------------------------------------------------------------------- | --------- | --------------------------------------------------------------------------- |
+| [`VedaVaultRegistry`](../../../src/earn/engines/veda/shared/VedaVaultRegistry.sol)                                   | Per vault | The vault's Teller, optional Queue with its stock solver, and Accountant    |
+| [`VedaStackFactory`](../../../src/earn/engines/veda/shared/VedaStackFactory.sol)                                     | Per vault | Operator-gated: builds, binds, authorizes and records a stack               |
+| [`VedaEngineDeployer`, `VedaForwardingSolverDeployer`](../../../src/earn/engines/veda/shared/VedaStackDeployers.sol) | Per chain | Hold the engine's and the forwarding solver's creation code for the factory |
+| [`VedaRoleGranter`](../../../src/earn/engines/veda/shared/VedaRoleGranter.sol)                                       | Per vault | Grants the two Earn roles and, for a Teller that admits by account, lists   |
+| [`VedaForwarderSteward`](../../../src/earn/engines/veda/shared/VedaForwarderSteward.sol)                             | Per vault | Owns the forwarding solvers and approves the vault's solvers on each        |
 
 **The vault's administrator** is the BoringVault's owner, or the owner of the BoringVault's current
 authority. Both can already take custody of the vault, so naming them adds no trust root. Both are
@@ -42,93 +41,51 @@ whose owner is zero, the administrator is the timelock that owns the RolesAuthor
 ## Vault registry
 
 The registry is ownerless and immutable to one BoringVault and base asset. Only the administrator
-calls `publish(teller, queue, accountant, solver, minRate, maxRate, maxReportAge)`. A Queue and its
-stock solver are published together, or both are zero for an immediate-only vault.
+calls `publish(teller, queue, accountant, solver)`. A Queue and its stock solver are published
+together, or both are zero for an immediate-only vault. It exposes what a `VedaEngine` reads from its
+periphery registry (`vault`, `baseAsset`, `teller`, `queue`, `accountant`, `version`, `engine`), plus
+the stock solver and `isVaultAdmin`.
 
-**A publication reaches every engine of the vault in the same call.** No engine owner pauses
-deposits, supplies rate bounds, or activates anything, so publication runs the checks an engine used
-to run and refuses a tuple unless:
+**A publication changes no engine.** New stacks are built on it, and each existing engine keeps the
+tuple it cached until its owner pauses its EarnVault's deposits and calls
+`syncVedaPeriphery(minRate, maxRate)`, where the engine checks the wiring, the report's age and the
+safe rate against the owner's bounds. A replaced Teller, Queue and stock solver therefore stay live
+until every engine has moved and every request on the old Queue is closed
+([publications](#publications)).
+
+Publication refuses a tuple unless:
 
 - every module has code, the Teller and a nonzero Queue report this BoringVault and the new
   Accountant, the Accountant reports this BoringVault and the base asset, and the stock solver is
   none of those contracts;
 - a nonzero Queue has onchain tracking enabled;
+- the Teller is the vault's owner or its authority allows it `enter` and `exit`, which an engine does
+  not check before it activates a tuple; and
 - where the Teller keeps an [account allowlist](#teller-allowlist), a Queue that applies one applies
   this Teller's, and the stock solver is on it, because the solver redeems every settled request
-  through the Teller;
-- the Teller is the vault's owner or its authority allows it `enter` and `exit`, because a Teller
-  that cannot mint and burn would stop every stack's deposits and immediate exits at once;
-- the Accountant's report age is readable through one of the two supported surfaces
-  ([valuation and freshness](veda.md#valuation-and-freshness)), nonzero, not in the future, and no
-  older than `maxReportAge`; and
-- the Accountant's safe rate lies within `[minRate, maxRate]`.
+  through the Teller.
 
 These checks do not show that a module's code is benign, that the stock solver holds its Veda
-permissions, or that the Earn stacks are admitted to the new modules or listed on the new Teller
-([publications](#publications)). The rate bounds are the caller's: `1` and the maximum waive the
-check. A rate that jumps inside the bounds is priced by every stack at once, and an upward jump makes
-each stack's `EarnFees` charge fees on a gain that did not happen, which a corrective publication
-does not undo. Schedule a publication with bounds tight around the outgoing Accountant's rate.
+permissions, or that the Earn stacks are admitted to the new modules.
 
-**Deposit halt.** The registry also holds one flag per engine. `haltDeposits(engine)` is the
-vault's pausers' (the administrator, or an account the BoringVault's authority lets call it on the
-registry); `resumeDeposits(engine)` is the administrator's alone. A halted engine refuses deposits
-(`DepositsHalted`), which stops the EarnVault's deposits and contributions, and every exit keeps
-working: immediate exits, new and already queued requests, cancellations and settlements. It is the
-vault's side of the EarnVault's own deposit pause, which a stack's owner can lift, for an owner who
-will not or cannot pause. `depositsHalted(engine)` reports it; the EarnVault's capacity views do not.
-
-The halt binds an engine, whose code is fixed, and nothing else. It is a stop only where the Teller
-restricts who may call `bulkDeposit`. Where the vault opens `bulkDeposit` to every caller and admits
-by the [Teller's list](#teller-allowlist), anyone can mint shares straight to a listed engine and
-have its EarnVault absorb them, which the EarnVault gates only with the pause the stack's owner
-controls. There the halt stops the stack's ordinary deposits and no more, and delisting, which also
-stops exits, is the only stop.
-
-## Lockstep engine
-
-`VedaLockstepEngine` holds one EarnVault's BoringVault shares exactly as `VedaEngine` does. Its
-vault, registry and base asset are immutable. It differs in these ways only:
-
-- **No cached modules.** `teller()`, `queue()` and `accountant()` read the registry. There is no
-  `syncVedaPeriphery`, and the engine advertises `IEarnEngineAsyncRedeem` exactly while the registry
-  publishes a Queue.
-- **No registry binding.** `initializeEarnVault` is owner-only and set-once but needs no reciprocal
-  registry entry. An engine is useful only once it is authorized on the Teller and Queue.
-- **Construction** requires only a published registry. The registry validates each tuple it
-  publishes, so the constructor checks no wiring or report age.
-- **Claims and counts.** A claim still records its originating Queue, so a publication strands
-  neither a cancellation nor a settlement. `openClaimsByQueue` covers every Queue alike.
-- **One standing share allowance.** The one-unit allowance follows the Queue of the latest request:
-  the next request on a newly published Queue clears the previous one, and anyone may clear it
-  sooner with `clearRetiredQueueAllowance`. A request also requires the Queue to leave exactly that
-  unit.
-- **Deposit halt.** `deposit` first asks the registry whether the vault's pausers halted this
-  engine's deposits. No other function reads it.
-- **Fee freshness fails soft.** `isFeeValuationFresh` returns false, instead of reverting, when the
-  Accountant's report age cannot be read, so such an Accountant defers fees without blocking an exit.
-  Deposits still fail closed (`UnsupportedAccountantFreshness`).
-
-The engine approves the immutable BoringVault, never the Teller, and measures every share and asset
-movement. A wrong Teller can therefore move the engine's assets only into the vault and must mint a
-measured share increase; a wrong Queue can take exactly the requested shares and must return a
-matching tracked request. A transaction that prices one engine operation and then meets a
-publication quoting another rate reverts (`RateChangedWithinTransaction`).
-
-The engine's owner keeps only wrapper-local settings: `setMaxRateAge`, `setAuthorizedForwarder`,
-`recoverExternalSettlement` and `sweepDust`, with the bounds [Veda](veda.md#vedaengine) gives them.
+**It binds no engine.** A `VedaEngine` binds its EarnVault only when its registry's `engine()` is the
+engine itself, which is how a `VedaPeripheryRegistry` lets the vault's owner pick its one engine.
+`VedaVaultRegistry.engine()` returns the caller, so the check passes for every engine built on it and
+selects none. Which engines the vault serves is decided where the permissions are: by the
+[role granter](#role-granter), for the engines a named factory built. An engine anyone else deploys on
+the registry holds no role and no place on a Teller's list. Read off-chain, `engine()` returns the
+address the call was made from and says nothing.
 
 ## Stack factory
 
-`VedaStackFactory` is immutable to one registry, an [authorizer](#authorization), a
-[Teller lister](#teller-allowlist), the canonical `EarnFactory`, the two deployers, and the owner and
-treasury of every forwarding solver it builds. The authorizer and the lister are each optional: a
-vault can gate its engines by role, by the Teller's list, or by both. `EarnFactory` and both
-deployers are pinned by address and by the code hash named at construction.
+`VedaStackFactory` is immutable to one registry, the vault's [role granter](#role-granter), the
+canonical `EarnFactory`, the two deployers, and the owner and treasury of every forwarding solver it
+builds. `EarnFactory` and both deployers are pinned by address and by the code hash named at
+construction.
 
 `createStack(jobId, engineParams, core, newTransferPolicyAdmin)`, callable only by the operator:
 
-1. deploys a `VedaLockstepEngine` through the pinned deployer, owned by the factory;
+1. deploys a `VedaEngine` on the registry through the pinned deployer, owned by the factory;
 2. calls `EarnFactory.deploy(core)` with that engine, creating the EarnVault, EarnShare and EarnFees
    ([contract reference](../reference/contracts.md#earnfactory));
 3. when the vault publishes a Queue, deploys a `VedaForwardingSolver` for this engine against the
@@ -136,10 +93,9 @@ deployers are pinned by address and by the code hash named at construction.
    solvers on it, and authorizes it on the engine;
 4. calls `initializeEarnVault(earnVault, core.owner)`, binding the engine to the EarnVault the
    canonical factory just produced and handing it to the stack's owner in the same call;
-5. authorizes the engine and the forwarding solver through the authorizer and lists the engine
-   through the lister, then requires that each is actually allowed its calls by the module's own
-   authority and that a Teller with an account allowlist admits the engine
-   (`NotAuthorizedOnVeda`, `NotListedOnTeller`); and
+5. has the granter admit the engine and the forwarding solver, then requires that each is actually
+   allowed its calls by the module's own authority and that a Teller with an account allowlist
+   admits the engine (`NotAuthorizedOnVeda`, `NotListedOnTeller`); and
 6. records the stack (`stack(engine)`) and emits `StackCreated`.
 
 `jobId` is the caller's own nonzero id for the build. It builds one engine: a second `createStack`
@@ -156,28 +112,29 @@ meaning unrestricted; a nonzero `newTransferPolicyAdmin` instead creates a TIP-4
 administered by that address and attaches it. A protected stack is unusable until its policy's
 administrator authorizes the [required members](access.md#required-members).
 
-The factory builds nothing until the administrator names it on its authorizer and on its lister,
-whichever it has (`AuthorizerNotBound`). It authorizes only contracts it built itself. Checking an engine's code
-would not be enough, because a canonical engine lets its owner bind any EarnVault: the factory owns
-each engine from construction until it binds it, and refuses any engine it did not deploy in its own
-call (`EngineNotPending`), including one made through the public deployer with the factory named as
-owner.
+The factory builds nothing until the administrator names it on the granter (`AuthorizerNotBound`). It
+authorizes only contracts it built itself. Checking an engine's code would not be enough, because a
+canonical engine lets its owner bind any EarnVault: the factory owns each engine from construction
+until it binds it, and refuses any engine it did not deploy in its own call (`EngineNotPending`),
+including one made through the public deployer with the factory named as owner.
 
 **One call or two.** `deployEngine` followed by `finalizeStack` builds the same stack in two
 transactions; in between, the engine is owned by the factory, bound to nothing and authorized for
-nothing. `finalizeStack` accepts a pending engine once, so it needs no job id. Under Tempo's T8
-pricing, with the fixture TIP-20 factory and Veda modules, against the 30M per-transaction cap:
+nothing. `finalizeStack` accepts a pending engine once, so it needs no job id. An engine fixes its
+modules when it is deployed, so `finalizeStack` refuses one the vault has published past
+(`EnginePeripheryStale`); deploy another under a new job id. Under Tempo's T8 pricing, with the
+fixture TIP-20 factory and Veda modules, against the 30M per-transaction cap:
 
-| Build                               | Role granter | Role granter, Teller lister and steward |
-| ----------------------------------- | ------------ | --------------------------------------- |
-| `createStack`, vault with a Queue   | 28.9M        | 29.7M                                   |
-| `createStack`, immediate-only vault | 23.6M        | 24.1M                                   |
-| `deployEngine`                      | 13.3M        | 13.3M                                   |
-| `finalizeStack`, vault with a Queue | 15.7M        | 16.5M                                   |
+| Build                               | Teller that gates callers | Teller with a list, and a steward |
+| ----------------------------------- | ------------------------- | --------------------------------- |
+| `createStack`, vault with a Queue   | 30.3M                     | 31.1M                             |
+| `createStack`, immediate-only vault | 24.5M                     | 25.0M                             |
+| `deployEngine`                      | 14.7M                     | 14.7M                             |
+| `finalizeStack`, vault with a Queue | 15.7M                     | 16.5M                             |
 
-Use the two-call path on a vault with a Queue: one call leaves no usable margin there, and the
-figures come from fixtures, not the live precompiles. The steward column has one listed solver; each
-further solver adds a storage write to every forwarder built.
+On Tempo a vault with a Queue needs the two-call path: one call is over the cap. The figures come
+from fixtures, not the live precompiles. The steward column has one listed solver; each further
+solver adds a storage write to every forwarder built.
 `EarnFactory` is open to anyone, so someone who sees a pending `finalizeStack` can create the same
 core first and make it revert; finalize again under another `deploymentId`. Such a core is bound to
 nothing and holds nothing.
@@ -194,58 +151,41 @@ reduce what the factory and its stacks can do. A paused factory refuses every op
 
 The records say what the factory last did, not what is permitted now: the administrator can change a
 permission or the Teller's list directly, and a function the vault lets anyone call stays callable by
-a revoked engine unless the Teller's list is what admits it. `isEngineReady(engine)` reads the
-published modules live: an active stack whose engine they allow its calls and, where the Teller keeps
-a list, admit. It does not cover a paused Teller, a deposit cap, the registry's deposit halt or the stack's
-own controls.
+a revoked engine unless the Teller's list is what admits it. `isEngineReady(engine)` reads live the
+Teller and Queue the engine itself uses, which are the published ones only once its owner has
+activated them: an active stack whose engine they allow its calls and, where the Teller keeps a
+list, admit. It does not cover a paused Teller, a deposit cap or the stack's own controls.
 `isForwarderReady(forwarder, solver)` reads the wiring and permissions of the queued path, which
-may go unused for a long time: the forwarder is active, fixed to the Queue, stock solver and Teller
-published now, admitted by its engine, allowed on the stock solver, and has `solver` approved, and a
-Teller with a list admits the stock solver and, where the Queue applies that list, the engine. True
-does not mean a settlement would succeed: it covers no pause, liquidity, deficit, transfer policy,
-maturity or deadline, nor the stock solver's own permissions.
+may go unused for a long time: the forwarder is active, fixed to the Queue and Teller its engine
+uses now and, once the engine is on the published tuple, to the published stock solver, admitted by
+its engine, allowed on its stock solver, and has `solver` approved, and a Teller with a list admits
+the stock solver and, where the Queue applies that list, the engine. True does not mean a settlement
+would succeed: it covers no pause, liquidity, deficit, transfer policy, maturity or deadline, nor the
+stock solver's own permissions.
 `stack(engine).forwarder` is the forwarding solver built with the stack, and a later
 `deployForwarder` does not change it; `ForwarderDeployed` lists every forwarder, and the engine's
 `authorizedForwarder` says which ones its owner admitted.
 
-## Authorization
+## Role granter
 
-A Veda module asks its authority whether a caller may call a function. Where the vault restricts
-those calls, a factory writes each authorization through one `IVedaStackAuthorizer`. Two exist. Use
-the role granter unless the vault's administrator will not let any contract write to its
-RolesAuthority. A factory needs neither where the vault opens every call an engine makes to all
-callers and admits by the [Teller's list](#teller-allowlist) alone. That covers an immediate-only
-vault: with a Queue, each stack's forwarding solver needs a permission on the stock solver, which
-only an authorizer gives.
+A Veda module asks its authority whether a caller may call a function, and a RolesAuthority gates by
+function, not by argument: whoever may call `setUserRole` may give any role to anyone.
+`VedaRoleGranter` narrows that in code. The administrator points the RolesAuthority's own `authority`
+at the granter, whose `canCall` admits one triple: the granter, calling `setUserRole`, on that
+RolesAuthority. The owner keeps every power, no role number is spent on a registrar, and no
+capability row that targets the RolesAuthority becomes live, because the RolesAuthority does not
+consult its own role table for calls on itself.
 
-Either authorizer accepts only the factories the administrator names (`setFactory(factory, true)`),
-and names one only if it reports that authorizer and that authorizer's registry as its own. An engine
-trusts its registry for every module, so a factory that builds on some other registry must never
-receive the vault's authorizations; this check stops one from being named by mistake. It is a check
-of wiring, not of code: the administrator still reviews the factory it names. Several factories can
-be named at once ([replacing the factory](#replacing-the-factory)).
+The granter's RolesAuthority, registry, vault and two role numbers are immutable. Its only writes are
+`setUserRole` for those two roles and, [where the Teller keeps a list](#teller-allowlist),
+`setAllowedAccounts` for engines. It accepts only the factories the RolesAuthority's owner names
+(`setFactory(factory, true)`), and names one only if it reports this granter and this granter's
+registry as its own. An engine takes its modules from its registry, so a factory that builds on some
+other registry must never receive the vault's roles; this check stops one from being named by
+mistake. It is a check of wiring, not of code: the administrator still reviews the factory it names.
+Several factories can be named at once ([replacing the factory](#replacing-the-factory)).
 
-|                             | Role granter                                              | Overlay                                                                    |
-| --------------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------- |
-| An authorization is         | A role on the RolesAuthority                              | A flag in `VedaVaultAccessRegistry`                                        |
-| Live contracts changed      | The RolesAuthority's `authority`                          | The `authority` of the Teller, every Queue and every stock solver          |
-| Worst bug                   | Any role to anyone: custody of the vault                  | A wrong answer for a call on the Teller, a Queue or a stock solver         |
-| If the new contract fails   | Grants and revocations stop; nothing else is affected     | Those modules stop until replaced, since only the overlay can repoint them |
-| Role numbers and table rows | Two roles and their capabilities on each published module | None                                                                       |
-| Existing tooling            | Reads the RolesAuthority as before                        | Must read each module's own `authority`                                    |
-
-### Role granter
-
-A RolesAuthority gates by function, not by argument: whoever may call `setUserRole` may give any
-role to anyone. `VedaRoleGranter` narrows that in code. The administrator points the RolesAuthority's
-own `authority` at the granter, whose `canCall` admits one triple: the granter, calling
-`setUserRole`, on that RolesAuthority. The owner keeps every power, no role number is spent on a
-registrar, and no capability row that targets the RolesAuthority becomes live, because the
-RolesAuthority does not consult its own role table for calls on itself.
-
-The granter's RolesAuthority, registry, vault and two role numbers are immutable, its only writes
-are `setUserRole` for those two roles, and only a factory the RolesAuthority's owner named calls it.
-Before a grant it also requires that:
+Before a grant the granter also requires that:
 
 - it is still the RolesAuthority's authority, so the owner and the granter are the only paths to the
   role table;
@@ -265,102 +205,89 @@ cannot list a role's holders, so no contract here can check this:
   request on the Queue through the stock solver for the forwarder role. Read the RolesAuthority's
   `UserRoleUpdated` history for both numbers; and
 - a number that already carries a capability elsewhere (a manager, an Accountant) gives it to every
-  engine or forwarding solver. Only the custody and role-administration functions above are checked;
-  anything else is harmless only because the holders are fixed-code contracts the factory builds.
+  engine or forwarding solver. Only the custody and role-administration functions above are checked.
 
-Pointing the RolesAuthority's `authority` elsewhere stops new grants and the granter's revocations
-alike. Roles already granted stay until the owner clears them or removes the roles' capabilities, so
-pause and revoke through the factory first.
+Pointing the RolesAuthority's `authority` elsewhere stops new grants and the granter's role
+revocations alike. Roles already granted stay until the owner clears them or removes the roles'
+capabilities, so pause and revoke through the factory first.
 
-### Overlay
+### Teller allowlist
 
-Nothing writes to the RolesAuthority. The Teller, each Queue and each stock solver ask their own
-`authority` whether a caller may call a function; the administrator points those at a
-`VedaAuthorityOverlay`, and the BoringVault keeps the RolesAuthority. The overlay has no owner and
-no storage:
+One granter serves both kinds of Teller. A Teller either gates its callers, and then the engine
+role's capabilities are what admit an engine, or it also checks the account whose position changes,
+whoever calls: a deposit needs its share recipient on the Teller's list and a withdrawal its share
+owner, each while that direction is enforced, and a Queue bound to the Teller (`queue.teller()`)
+applies the same list to a request's owner when the request is filed and again when it is settled.
+On such a vault a role is not enough to use the Teller, and where the vault opens the bulk paths to
+every caller a role decides nothing: the list alone admits an engine to the Teller and delisting
+alone stops it there.
 
-1. it returns true whenever the RolesAuthority allows the call, before reading anything else, so
-   every permission that RolesAuthority gives, including the one that repoints an authority, depends
-   on nothing new;
-2. otherwise it asks `VedaVaultAccessRegistry.canStackCall`, and treats a revert, missing code or
-   any answer but a well-formed true as a denial.
+`tellerAllowlist` says which kind the vault runs. The RolesAuthority's owner sets it with
+`setTellerAllowlist(bool)`. It starts clear, for a Teller that gates callers only. While it is set:
 
-`canStackCall` allows an active engine `bulkDeposit` and `bulkWithdraw` on the published Teller and
-`requestOnChainWithdraw` and `cancelOnChainWithdrawUsingRequestId` on an honored Queue, and an active
-forwarding solver `boringRedeemSolve` on an honored stock solver. It never answers for the
-BoringVault. A Queue and its stock solver are honored from publication until the administrator
-retires them (`setQueueHonored`, `setSolverHonored`), which it must not do while any engine's
-`openClaimsByQueue` for that Queue is nonzero; honoring one again undoes a mistake without
-republishing it.
+- authorizing an engine also lists it on the registry's published Teller, and reverts unless the
+  Teller reports it listed;
+- revoking an engine also delists it; and
+- anyone may call `relist`.
 
-`VedaVaultAccessRegistry` is the vault registry plus that record. Only a factory the
-administrator named writes it. The registry creates the overlay itself
-(`createOverlay`, open to anyone, at the address `predictOverlay` reports) and binds only an overlay
-it created, for the RolesAuthority the BoringVault answers to now (`setOverlay`), so the overlay's
-code needs no separate review. While an overlay is bound, a publication is refused unless its
-Teller, Queue and stock solver already answer to it, and unless the overlay still passes through the
-vault's RolesAuthority.
-
-## Teller allowlist
-
-Some Veda Tellers also check the account whose position changes, whoever calls: a deposit needs its
-share recipient on the Teller's list and a withdrawal its share owner, each while that direction is
-enforced, and a Queue bound to the Teller (`queue.teller()`) applies the same list to a request's
-owner when the request is filed and again when it is settled. On such a vault a role is not enough to
-use the Teller, and where the vault opens the bulk paths to every caller a role decides nothing: the
-list alone admits an engine to the Teller and delisting alone stops it there.
-
-`VedaTellerLister` writes that list for a factory. The administrator lets it call
-`setAllowedAccounts` on the Teller and names the factories it accepts, with the same wiring check as
-an authorizer. `setAllowedAccounts` takes any accounts, so only the lister's code keeps the
+The role is granted either way, since a Queue and a stock solver gate their callers on both kinds of
+vault. The owner lets the granter call `setAllowedAccounts` on a Teller that keeps a list, through a
+role nothing else holds. That function takes any accounts, so only the granter's code keeps the
 permission to Earn engines. `listedOn(engine)` is its record: the Teller it last listed the engine
-on, `address(1)` once it delisted the engine, zero for an account it never listed.
+on, `address(1)` once it revoked an engine it had listed, zero for an engine it never listed.
 
-| Function                    | Caller          | What it writes                                                             |
-| --------------------------- | --------------- | -------------------------------------------------------------------------- |
-| `setEngineListed`           | A named factory | Lists an engine as the factory builds or reinstates it; delists on revoke  |
-| `revokeListing(engine)`     | Administrator   | Delists an engine the lister listed, for a factory that is no longer named |
-| `relist(engines)`           | Anyone          | Lists recorded engines on the Teller published now, once per Teller        |
-| `redelist(engines)`         | Anyone          | Takes delisted engines off the Teller published now                        |
-| `assertSetup(reg, factory)` | Anyone (a view) | Nothing; reverts unless the [setup](#setup) is complete                    |
+| Function                    | Caller                    | What it writes                                                                |
+| --------------------------- | ------------------------- | ----------------------------------------------------------------------------- |
+| `setEngineAuthorized`       | A named factory           | The engine role and, with the flag set, the engine's listing, or removes both |
+| `setForwarderAuthorized`    | A named factory           | The forwarder role                                                            |
+| `setFactory`                | The RolesAuthority owner  | The factories it accepts                                                      |
+| `setTellerAllowlist`        | The RolesAuthority owner  | The flag; no list changes                                                     |
+| `relist(engines)`           | Anyone, with the flag set | Lists engines that hold the engine role on the Teller published now           |
+| `redelist(engines)`         | Anyone                    | Takes revoked engines off the published Teller and the one each engine uses   |
+| `assertSetup(reg, factory)` | Anyone (a view)           | Nothing; reverts unless the [setup](#setup) is complete                       |
 
-- Listing refuses an account without code and reverts unless the Teller reports the engine listed.
-- Delisting always records the engine as delisted, so nothing here can list it again, and reports
-  whether the Teller's list still holds it. When it does (a Teller without a list, or one the lister
-  may not write), `EngineDelistingDeferred` says so and `redelist` finishes it later. Only an account
-  the lister listed can be delisted through it.
-- `relist` and `redelist` skip every account that is not theirs to write, so one revoked engine does
-  not fail a batch. `relist` skips an engine whose latest listing by the lister was on this Teller.
+- **Listing follows the engine role.** `relist` lists a contract that holds the engine role, which a
+  named factory or the owner gave it, and skips everything else, so one revoked engine does not fail
+  a batch. It is how the vault's engines reach a newly published Teller before their owners activate
+  it, and how engines authorized before the flag was set reach the list. It skips an engine whose
+  latest listing by the granter was on this Teller.
+- **Revoking removes the role and each listing independently.** A RolesAuthority that no longer
+  admits the granter does not keep an engine listed (`EngineRoleRevocationDeferred`), and a Teller
+  that cannot be written does not keep the role (`EngineDelistingDeferred`, which `redelist`
+  finishes). The engine is recorded so that nothing here lists it again. The call reverts only when
+  the role could not be cleared and there was no listing to remove.
+- **Where it delists.** On the published Teller, which the engine's owner could activate; on the
+  Teller the engine reports, which it uses until then; and on the Teller the granter last listed it
+  on. An engine can activate only the published Teller, so a listing left on any other Teller is one
+  it cannot use. An engine is delisted when the granter listed it or when it holds the engine role
+  while the flag is set; the stock solver and any other account are not the granter's to remove.
 
-The lister reads `allowedAccounts`, `isDepositAllowed` and `isWithdrawAllowed` on the Teller. A
-forwarding solver holds no shares and is never listed. The stock solver redeems settled requests
+A forwarding solver holds no shares and is never listed. The stock solver redeems settled requests
 through the Teller and must be on the list; the administrator lists it, and publication checks it.
 
-**The record is not the list.** The administrator can change the Teller's list directly, and the
-lister does not learn of it. `relist` does not repeat the lister's latest listing, so a direct
+**The record is not the list.** The administrator can change a Teller's list directly, and the
+granter does not learn of it. `relist` does not repeat the granter's latest listing, so a direct
 delisting on the Teller that listing was made on stays, but the engine is carried to the next Teller
-published: to keep an engine off, use `revokeEngine` or `revokeListing`. A direct listing of an
-engine the lister delisted is removed by `redelist`; reinstating the engine through its factory is
-what lists it again. The list lives in each Teller, so a delisted engine is still on any other Teller
-it was listed on, and `redelist` after a publication is what removes it there
-([publications](#publications)).
+published while it holds the engine role: to keep an engine off, use `revokeEngine`. A direct listing
+of an engine the granter revoked is removed by `redelist`; reinstating the engine through its factory
+is what lists it again.
 
 **What delisting stops.** An engine's deposits and immediate exits together and, on a Queue bound to
 the Teller, its new requests and the settlement of the ones already queued. A request that passes
-its deadline while its engine is delisted does not settle afterwards. There is no deposit-only stop.
-Delisting stops nothing on a Queue that applies no list, or on a replaced Queue still bound to
-another Teller, and a Teller that stops enforcing its list admits every account, whatever the lister
-recorded. Keep the Teller's routed deposit, which mints to a named recipient under the share lock,
-restricted to trusted callers: a deposit to an engine would lock the engine's shares against a
-queued request.
+its deadline while its engine is delisted does not settle afterwards. There is no deposit-only stop
+from the vault's side: a stack's own deposit pause is its EarnVault's, and where the vault opens
+`bulkDeposit` to every caller, anyone can mint shares to a listed engine. Delisting stops nothing on
+a Queue that applies no list, and a Teller that stops enforcing its list admits every account,
+whatever the granter recorded. Keep the Teller's routed deposit, which mints to a named recipient
+under the share lock, restricted to trusted callers: a deposit to an engine would lock the engine's
+shares against a queued request.
 
-**Without a lister.** A factory still refuses to report a stack whose engine the Teller's list does
-not admit (`NotListedOnTeller`). With `deployEngine` and `finalizeStack`, whoever keeps the list can
-list the engine between the two calls, which makes admission a second key's decision at one
-transaction per stack. Before listing, that key confirms `stack(engine).status` is pending in the
-factory it trusts: the engine deployer is open to anyone, so an engine's code proves nothing about
-who built it. A factory with neither an authorizer nor a lister is named by no one and holds no
-permission; its records say only that it built a stack, and its `revokeEngine` reverts.
+**With the flag clear on a Teller that enforces a list**, the factory still refuses to report a stack
+whose engine the list does not admit (`NotListedOnTeller`), and `assertSetup` reverts
+(`TellerEnforcesList`). With `deployEngine` and `finalizeStack`, whoever keeps the list can list the
+engine between the two calls, which makes admission a second key's decision at one transaction per
+stack. Before listing, that key confirms `stack(engine).status` is pending in the factory it trusts:
+the engine deployer is open to anyone, so an engine's code proves nothing about who built it.
 
 ## Forwarder steward
 
@@ -387,133 +314,115 @@ each one from the factory's `ForwarderDeployed` events.
 
 ## Setup
 
-Deploy the deployers once per chain. Per vault, anyone deploys the registry, the authorizer and the
+Deploy the deployers once per chain. Per vault, anyone deploys the registry, the granter and the
 factory; none holds a permission until the administrator's one batch, which a new vault's deployer
 runs before handing the vault over. Before that batch, review:
 
-- the verified code of the registry, the authorizer and the factory, since the onchain checks cover
+- the verified code of the registry, the granter and the factory, since the onchain checks cover
   their wiring and never their code;
-- the factory's `registry`, `authorizer`, `tellerLister`, `operator`, `forwarderOwner`,
-  `forwarderOwnerIsSteward`, `forwarderTreasury` and three pinned code hashes, against the registry being published on and the
+- the factory's `registry`, `authorizer`, `operator`, `forwarderOwner`, `forwarderOwnerIsSteward`,
+  `forwarderTreasury` and three pinned code hashes, against the registry being published on and the
   reviewed release;
-- with the role granter, its `rolesAuthority`, `registry` and two role numbers, and that
+- the granter's `rolesAuthority`, `registry` and two role numbers, and that
   [nothing else holds or uses those numbers](#role-granter); and
-- with the Teller lister, its `registry`; and
 - with a forwarder steward, its verified code, its owner and its list of solvers.
 
-Both variants:
+Confirm the RolesAuthority's `authority` is zero, since setting it displaces whatever was there. The
+batch:
 
-1. `registry.publish(...)` with the vault's live modules.
-2. Give the vault's pause roles the factory's `revokeEngine`, `revokeForwarder`,
-   `pauseRegistrations` and `discardEngine`, and the registry's `haltDeposits`.
-
-Restrict who may call the Teller's `bulkDeposit` to the vault's engines where the vault can, even
-when the Teller also keeps a list: the registry's [deposit halt](#vault-registry) is a stop only
-then.
-
-Role granter. Confirm the RolesAuthority's `authority` is zero, since setting it displaces whatever
-was there.
-
-1. Give the Earn engine role `bulkDeposit` and `bulkWithdraw` on the Teller and, with a Queue,
-   `requestOnChainWithdraw` and `cancelOnChainWithdrawUsingRequestId` on it.
-2. Give the Earn forwarder role `boringRedeemSolve` on the stock solver.
-3. `rolesAuthority.setAuthority(granter)`, then `granter.setFactory(factory, true)`.
-4. `granter.assertSetup(registry, factory)`, naming the registry published in this batch. It reverts
-   the batch unless the granter was built for that registry, the factory is named, and every
-   pre-grant check passes for both roles.
-
-Overlay. Deploy `VedaVaultAccessRegistry` as the registry and call `createOverlay()`. Confirm the
-Teller, the Queue and the stock solver each answer to the vault's RolesAuthority now: the overlay
-passes that RolesAuthority through, and a permission another authority gave would be lost.
-
-1. `setAuthority(overlay)` on the Teller, the Queue and the stock solver.
-2. `registry.setOverlay(overlay)`, which requires the published modules to answer to the overlay,
-   then `registry.setFactory(factory, true)`.
-
-Teller lister, on a vault whose Teller keeps an account allowlist, beside whichever authorizer the
-vault needs:
-
-1. List the stock solver on the Teller and bind the Queue to it (`queue.setTeller(teller)`), before
-   `registry.publish(...)`.
-2. Give a role nothing else holds `setAllowedAccounts` on the Teller, and give that role to the
-   lister.
-3. `lister.setFactory(factory, true)`.
-4. `lister.assertSetup(registry, factory)`. It reverts the batch unless the lister was built for that
-   registry, the factory is named, the published Teller enforces its list in both directions, lets
-   the lister write it and does not let an account without a role write it, and a published Queue
-   applies that same list with its stock solver on it. It cannot show that no other account holds the
-   role that writes the list. The lister itself must not be on the list, which is how it tells an
-   enforced list from an idle one.
+1. `registry.publish(...)` with the vault's live modules. For a Teller that keeps a list, first list
+   the stock solver on it and bind the Queue to it (`queue.setTeller(teller)`).
+2. Give the Earn engine role `bulkDeposit` and `bulkWithdraw` on the Teller and, with a Queue,
+   `requestOnChainWithdraw` and `cancelOnChainWithdrawUsingRequestId` on it. Where the vault opens a
+   function to every caller, the role's capability on it is unused.
+3. Give the Earn forwarder role `boringRedeemSolve` on the stock solver.
+4. `rolesAuthority.setAuthority(granter)`, then `granter.setFactory(factory, true)`.
+5. Give the vault's pause roles the factory's `revokeEngine`, `revokeForwarder`,
+   `pauseRegistrations` and `discardEngine`.
+6. For a Teller that keeps a list: give a role nothing else holds `setAllowedAccounts` on the
+   Teller, give that role to the granter, and call `granter.setTellerAllowlist(true)`.
+7. `granter.assertSetup(registry, factory)`, naming the registry published in this batch. It reverts
+   the batch unless the granter was built for that registry, the factory is named, every pre-grant
+   check passes for both roles, and the flag matches the published Teller:
+   - with the flag clear, the Teller does not refuse the granter as an account, as a Teller that
+     enforces a list would refuse every engine;
+   - with the flag set, the Teller enforces its list in both directions, lets the granter write it
+     and does not let an account without a role write it, and a published Queue applies that same
+     list with its stock solver on it. It cannot show that no other account holds the role that
+     writes the list. The granter itself must not be on the list, which is how it tells an enforced
+     list from an idle one.
 
 ## Operations
 
 ### Publications
 
-Every publication is the administrator's and reaches every stack at once, with no staging. Alongside
-it:
+Every publication is the administrator's. It moves no stack: each engine's owner activates it. In
+the publication batch:
 
-- admit the Earn stacks to the new modules: with the role granter, add the Earn roles' capabilities
-  on them in the same batch; with the overlay, point them at the overlay first;
 - give the new modules their own Veda permissions, including the stock solver's;
-- for a Teller that keeps an account allowlist: give the lister's role `setAllowedAccounts` on it
-  and, in the same batch after publishing, call `lister.relist(engines)` and
-  `lister.redelist(engines)` with every engine of the vault's factories (`engineAt`), then
-  `lister.assertSetup(registry, factory)`. The list lives in the Teller: a new Teller starts without
-  the vault's engines, so until `relist` every engine's deposits and exits revert, and a Teller
-  published before still lists engines revoked since, which `redelist` removes. Both read the
-  lister's record when they run, so an engine revoked while the batch waits is handled correctly.
-  Listing engines on the new Teller directly before publishing bypasses that record: a pauser's
-  revocation in between leaves the engine on the new Teller, and only `redelist` takes it off.
-  `isEngineReady` shows which active engines the published Teller admits; compare the Teller's
-  `allowedAccounts` with `listedOn` for the rest;
-- after a change of Queue, stock solver or Teller, have the operator call `deployForwarder(engine)`
-  for each stack and each stack's owner call `setAuthorizedForwarder` on its engine. A forwarding
-  solver fixes all three at construction, so until both steps are done, requests filed on the new
-  Queue cannot be settled; and
-- keep a replaced Queue, its stock solver, its Teller and the stacks' old forwarding solvers live
-  until `openClaimsByQueue(queue)` is zero on every engine. The factory builds a forwarding solver
-  only for the tuple published now.
+- admit the Earn stacks to them by adding the Earn roles' capabilities on them;
+- for a Teller that keeps a list: list the stock solver, bind the Queue, give the granter's role
+  `setAllowedAccounts` on it, set the flag if this is the vault's first such Teller, and after
+  publishing call `granter.relist(engines)` and `granter.redelist(engines)` with every engine of the
+  vault's factories (`engineAt`). An engine whose owner activates a Teller that does not list it has
+  its deposits and exits refused until `relist` carries it, so list before any owner is asked to
+  activate. Both functions read the granter's record and the role table when they run, so an engine
+  revoked while the batch waits is handled correctly. Listing engines on the new Teller directly
+  bypasses the record: a revocation still delists an engine that holds the engine role, and
+  `redelist` removes one revoked before the Teller was published; and
+- end with `granter.assertSetup(registry, factory)`.
+
+Then, for each stack:
+
+- after a change of Queue, stock solver or Teller, the operator calls `deployForwarder(engine)`. A
+  forwarding solver fixes all three at construction;
+- the stack's owner pauses deposits, calls `setAuthorizedForwarder` for the new forwarder and
+  `syncVedaPeriphery` with bounds tight around the outgoing rate, checks the stack, and resumes
+  deposits ([periphery rotation](veda.md#periphery-rotation)). A request filed on a new Queue before
+  its forwarder is admitted waits until it is; and
+- `isEngineReady` and `isForwarderReady` show the result.
+
+Keep a replaced Teller, Queue and stock solver, the Earn roles' capabilities on them, and the stacks'
+old forwarding solvers live until every engine's `peripheryVersion` is the published one and
+`openClaimsByQueue(queue)` is zero on every engine. The factory builds a forwarding solver only for
+the tuple published now. An owner who does not activate a publication keeps its stack on modules the
+administrator wants to retire: the vault's side can stop that stack with `revokeEngine`, and cannot
+move it.
 
 ### Incidents
 
 - **A leaked operator key.** Call `pauseRegistrations` first: it stops every operator call at once.
   Then revoke the engines that key built, and have the administrator replace the operator
   (`setOperator`) before it resumes registrations.
-- **One stack that should take no more deposits.** `registry.haltDeposits(engine)` stops its
-  deposits and contributions and leaves every exit working, whoever owns the stack. Where the Teller
-  restricts who may call `bulkDeposit`, use it before revoking. Where the vault opens `bulkDeposit`
-  to every caller it does not stop shares minted straight to the engine, and only `revokeEngine`
-  does.
 - **One stack.** `revokeEngine` stops its deposits and immediate exits, and its queued requests and
   cancellations unless the vault lets anyone call those. Its users cannot exit instantly until the
-  administrator reinstates it, so a false alarm costs them the administrator's delay. Where the
-  factory has a Teller lister, revoking also delists the engine, which is what stops it on a vault
+  administrator reinstates it, so a false alarm costs them the administrator's delay. With the
+  [flag](#teller-allowlist) set, revoking also delists the engine, which is what stops it on a vault
   that opens the Teller to every caller, and requests it already queued wait until it is reinstated
-  or pass their deadline. The role and the listing are removed independently, and
-  `EngineRevocationIncomplete` names a gate that was not removed: until that gate is gone the engine
-  may still work, on a vault open to every caller for as long as the Teller lists it. A lister that
-  accepts the call records the engine as delisted even when the Teller does not take the change, so
-  the revocation stands; finish it with `lister.redelist`. A listing the lister refused to touch
-  (its factory is no longer named there) is the administrator's to remove with `revokeListing`, and
-  so is a role the authorizer could not clear. `revokeEngine` reverts only when nothing was removed
-  or recorded. Without a lister on such a vault, `revokeEngine` stops nothing on the Teller: delist
-  the engine on the Teller directly.
+  or pass their deadline. Watch the granter's `EngineDelistingDeferred` and
+  `EngineRoleRevocationDeferred`: until the named Teller or the role is cleared the engine may still
+  work. Finish a deferred delisting with `granter.redelist`; a role the granter could not clear is
+  the RolesAuthority owner's to clear. `reinstateEngine` lists an engine on the published Teller, so
+  for an engine that has not activated it, the owner activates first or the administrator lists the
+  engine on its own Teller directly.
+- **A stack that should take no more deposits.** Its owner pauses its EarnVault's deposits. The
+  vault's side has no deposit-only stop: `revokeEngine` is its lever.
 - **The whole vault.** Pause the Teller as before; these contracts do not change that.
 
 ### Replacing the factory
 
 A factory is pinned to exact engine and core code, so a new release means a new factory, deployed
-against the same registry and authorizer and named by the administrator beside the old one. Each
+against the same registry and granter and named by the administrator beside the old one. Each
 factory reaches only the stacks it built. Keep the old factory named for as long as its stacks
 exist: its pausers revoke them, its operator builds their forwarding solvers after a publication,
 and the administrator reinstates them, all through it. Pause its registrations so that it builds no
 new stacks.
 
 Once the administrator stops naming a factory, that factory can change nothing. Its stacks keep
-their authorizations and keep working, but they cannot get a forwarding solver for a newly published
-Queue, and only the administrator can revoke them: with `setUserRole` on the RolesAuthority, with
-`revokeAccess` on the access registry, or with `revokeListing` on the Teller lister. Each leaves the
-factory's own record unchanged.
+their roles and listings, are still carried to a new Teller by `relist`, and keep working, but they
+cannot get a forwarding solver for a newly published Queue, and only the administrator can revoke
+them: with `setUserRole` on the RolesAuthority and `setAllowedAccounts` on the Teller. Each leaves
+the factory's own record and the granter's unchanged.
 
 ## Trust and failure modes
 
@@ -523,15 +432,13 @@ or `transferOwnership` on it.
 | If this fails                 | Worst case                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Operator key leaks            | Stacks with an owner, fees, controls, rate age bound and transfer policy of the attacker's choice. Their deposits and exits skip the Teller's share lock, so their owner can enter before a rate update and leave after it, which dilutes every holder of the BoringVault. Also forwarding solvers for existing stacks, which settle nothing until an engine's owner admits them. No role, no registry, no other stack's settings, no custody. |
-| Factory has a bug             | An authorization for an address that is not a genuine engine or forwarding solver: the same access as above, and for a forwarder, solving requests on the vault's Queue                                                                                                                                                                                                                                                                        |
-| Role granter has a bug        | Any role to anyone, which is custody of the vault. Nothing bounds it but its code.                                                                                                                                                                                                                                                                                                                                                             |
-| Teller lister has a bug       | A wrong list on the Teller: an account that may enter and leave the vault without the share lock, or engines whose deposits and exits stop. No role, no custody, no other Teller setting.                                                                                                                                                                                                                                                      |
+| Factory has a bug             | A role or a listing for an address that is not a genuine engine or forwarding solver: the same access as above, and for a forwarder, solving requests on the vault's Queue                                                                                                                                                                                                                                                                     |
+| Role granter has a bug        | Any role to anyone, which is custody of the vault, and any account on or off the Teller's list. Nothing bounds it but its code.                                                                                                                                                                                                                                                                                                                |
 | Forwarder steward's owner     | The solvers on every forwarder it owns, their treasuries and their surplus. A solver it approves can trigger settlement, which pays request owners through their engines. No custody of the vault.                                                                                                                                                                                                                                             |
 | A solver key leaks or is lost | Leaked: settlements at a time of the holder's choosing, paid as recorded. Lost: queued exits wait, and can pass their deadline, until the steward's owner lists another solver and each forwarder is seeded.                                                                                                                                                                                                                                   |
-| Overlay or its registry fails | A wrong answer for a call on the Teller, a Queue or a stock solver. A reverting RolesAuthority is the only way it denies an existing permission.                                                                                                                                                                                                                                                                                               |
-| Pauser is compromised         | Every stack revoked, every stack's deposits halted and registrations paused until the administrator restores them. No funds move.                                                                                                                                                                                                                                                                                                              |
-| A stack's owner is malicious  | Misuse of that engine's settings, as for any Veda stack ([Veda](veda.md#vedaengine)). No other stack is affected.                                                                                                                                                                                                                                                                                                                              |
-| Administrator                 | Unchanged in power. One publication now reaches every stack.                                                                                                                                                                                                                                                                                                                                                                                   |
+| Pauser is compromised         | Every stack revoked and registrations paused until the administrator restores them. No funds move.                                                                                                                                                                                                                                                                                                                                             |
+| A stack's owner               | Malicious: misuse of that engine's settings, as for any Veda stack ([Veda](veda.md#vedaengine)). Unresponsive: its stack stays on replaced modules after a publication. No other stack is affected.                                                                                                                                                                                                                                            |
+| Administrator                 | Unchanged in power. One publication is now offered to every stack, and each stack's owner activates it.                                                                                                                                                                                                                                                                                                                                        |
 
 Each stack picks its own EarnShare transfer policy; a vault-level rule is not inherited. Registration
 must never be opened to everyone, for that reason and for the share-lock exposure above. The
@@ -546,30 +453,30 @@ stand-ins for a finalized Veda vault whose every gated function asks its own aut
 release. The stand-ins model no transfer hook, share lock, pause, or Queue maturity, and give one
 account both the RolesAuthority's ownership and the role that repoints each module's authority.
 `AllowlistTeller` and `AllowlistQueue` stand in for a Teller with an account allowlist and a Queue
-bound to it.
+bound to it. The engine in every stack is the released `VedaEngine`, whose own suites are in
+[Veda](veda.md#tests).
 
-- `VedaLockstepEngine*.t.sol`: the `VedaEngine` accounting, async, fee-freshness and claim-ledger
-  invariant suites run against the lockstep engine, and `VedaLockstepEnginePeriphery.t.sol` covers
-  publications, Queue changes, and Tellers, Queues and Accountants that misbehave.
-- `VedaVaultRegistry.t.sol`: who administers a vault and every publication check.
-- `VedaStackFactory.t.sol`: every case runs once per authorization variant, including end-to-end
-  deposits, immediate exits and solved queued exits through a real EarnVault, a job id that builds
-  one engine however often it is sent, and a deposit halt that leaves every exit working.
+- `VedaVaultRegistry.t.sol`: who administers a vault, every publication check, that any number of
+  released engines bind on one registry, and that a publication moves an engine only when its owner
+  activates it.
+- `VedaStackFactory.t.sol`: a vault whose modules gate their callers, including end-to-end deposits,
+  immediate exits and solved queued exits through a real EarnVault, a job id that builds one engine
+  however often it is sent, stacks that activate a publication one owner at a time, and an engine
+  left pending across a publication.
 - `VedaRoleGranter.t.sol`: the granter's authority surface and pre-grant checks, and a stateful
   invariant that only factory-built contracts ever hold an Earn role and nothing else in the role
   table changes.
-- `VedaAuthorityOverlay.t.sol`: pass-through of the RolesAuthority, the five added calls, denial
-  without reverting when the registry is broken, and that nothing writes to the RolesAuthority.
+- `VedaRoleGranterAllowlist.t.sol`: a vault that opens the Teller to every caller and admits by its
+  list. Building lists the engine in the same call, a stack is never reported built while the list
+  refuses its engine, revoking delists and stops deposits, exits and queued settlement, the role and
+  the listing are each removed when the other cannot be, a direct delisting is not undone, a newly
+  published Teller is listed through `relist` before an owner activates it, revoking stops an engine
+  on the Teller it uses and on the one it could activate, a vault moves from a Teller that gates
+  callers to one that admits by account under the same granter and factory, and a stateful
+  invariant that the Teller's list holds the stock solver and exactly the active engines.
 - `VedaForwarderSteward.t.sol`: a forwarder built with the vault's solver approved settles with no
   transaction from its owner, the list reaches every forwarder through `seed` and `prune`, and
   `isForwarderReady` follows everything a queued exit needs.
-- `VedaTellerLister.t.sol`: a vault that opens the Teller to every caller and admits by its list.
-  Building lists the engine in the same call, a factory without a lister refuses an unlisted engine,
-  revoking delists and stops deposits, exits and queued settlement, each gate is removed even when
-  the other cannot be, a direct delisting is not undone, a newly published Teller needs `relist` and
-  a Teller that still lists a revoked engine needs `redelist`, an immediate-only vault needs no
-  authorizer, and a stateful invariant that the Teller's list holds the stock solver and exactly the
-  active engines.
 
 [`test/earn/gas/VedaStackGas.t.sol`](../../../test/earn/gas/VedaStackGas.t.sol) records stack-building gas
 in the [gas baseline](../../development/README.md#gas-baseline); run it under the `spend` profile for

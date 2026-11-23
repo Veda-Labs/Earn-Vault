@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.36;
 
-// Gas of building a stack through VedaStackFactory, in one call and in two, with each authorization
-// variant and on a vault whose Teller keeps an account allowlist. Run under the Tempo hardfork to read it against Tempo's per-transaction gas cap:
+// Gas of building a stack through VedaStackFactory, in one call and in two, on a vault whose Teller
+// gates its callers and on one whose Teller keeps an account allowlist. Run under the Tempo hardfork
+// to read it against Tempo's per-transaction gas cap:
 //   FOUNDRY_PROFILE=spend forge test --match-path test/earn/gas/VedaStackGas.t.sol --no-match-path none -vv
 // forge-lint: disable-start(multi-contract-file)
 import { console2 } from "forge-std/Test.sol";
 import { VedaForwarderSteward } from "../../../src/earn/engines/veda/shared/VedaForwarderSteward.sol";
 import { AuthedQueue, AuthedSolver, AuthedTeller } from "../helpers/VedaAuthMocks.sol";
-import {
-    VedaAllowlistStackTestBase,
-    VedaOverlayStackTestBase,
-    VedaRoleStackTestBase,
-    VedaStackTestBase
-} from "../helpers/VedaStackTestBase.sol";
+import { VedaAllowlistStackTestBase, VedaRoleStackTestBase, VedaStackTestBase } from "../helpers/VedaStackTestBase.sol";
 
 abstract contract VedaStackGasAudit is VedaStackTestBase {
     bytes32 internal constant STACK = keccak256("gas-stack");
@@ -88,14 +84,8 @@ contract VedaRoleStackGasAudit is VedaRoleStackTestBase, VedaStackGasAudit {
     }
 }
 
-contract VedaOverlayStackGasAudit is VedaOverlayStackTestBase, VedaStackGasAudit {
-    function setUp() public override(VedaStackTestBase) {
-        super.setUp();
-    }
-}
-
-/// @dev The role granter for the Queue and the stock solver, a Teller lister for the engine, and a
-///      steward that approves one solver on each forwarding solver: everything a build can write.
+/// @dev The role granter with its allowlist flag set, so that it also lists the engine, and a steward
+///      that approves one solver on each forwarding solver: everything a build can write.
 contract VedaAllowlistStackGasAudit is VedaAllowlistStackTestBase, VedaStackGasAudit {
     function setUp() public override(VedaStackTestBase) {
         address[] memory solvers = new address[](1);
@@ -119,6 +109,17 @@ contract VedaAllowlistStackGasAudit is VedaAllowlistStackTestBase, VedaStackGasA
 
     function _configureVeda() internal override(VedaStackTestBase, VedaAllowlistStackTestBase) {
         super._configureVeda();
+    }
+
+    function _adminSetupForTeller() internal override(VedaStackTestBase, VedaAllowlistStackTestBase) {
+        super._adminSetupForTeller();
+    }
+
+    function _admitModules(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_)
+        internal
+        override(VedaStackTestBase, VedaAllowlistStackTestBase)
+    {
+        super._admitModules(teller_, queue_, solver_);
     }
 }
 // forge-lint: disable-end(multi-contract-file)

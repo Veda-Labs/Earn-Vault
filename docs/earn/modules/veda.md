@@ -5,8 +5,8 @@ This page owns the `veda` engine kind: `VedaEngine`, `VedaPeripheryRegistry`, an
 data, deployment, authorities, and tests. The shared engine contract is in
 [yield engines](../integrations/engines.md). The three contracts are in the Sigma Prime PropAMM &
 Earn review and unchanged since ([audits](../audit/README.md)). Building many stacks on one
-BoringVault without an administrator transaction for each, with a registry every engine of the vault
-reads, is in [Veda shared-vault stacks](veda-shared-stacks.md).
+BoringVault without an administrator transaction for each, with these same engines on one registry
+for the whole vault, is in [Veda shared-vault stacks](veda-shared-stacks.md).
 
 `VedaEngine` ([source](../../../src/earn/engines/veda/VedaEngine.sol)) holds BoringVault shares for one
 EarnVault and drives the Teller, optional Queue, and Accountant that the BoringVault owner publishes.

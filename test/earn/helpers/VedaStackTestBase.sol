@@ -5,25 +5,17 @@ import { Test } from "forge-std/Test.sol";
 import { EarnFactory } from "../../../src/earn/core/EarnFactory.sol";
 import { EarnFees } from "../../../src/earn/core/EarnFees.sol";
 import { EarnVault } from "../../../src/earn/core/EarnVault.sol";
+import { VedaEngine } from "../../../src/earn/engines/veda/VedaEngine.sol";
 import { VedaForwardingSolver } from "../../../src/earn/engines/veda/VedaForwardingSolver.sol";
-import { VedaAuthorityOverlay } from "../../../src/earn/engines/veda/shared/VedaAuthorityOverlay.sol";
-import { VedaLockstepEngine } from "../../../src/earn/engines/veda/shared/VedaLockstepEngine.sol";
 import { VedaRoleGranter } from "../../../src/earn/engines/veda/shared/VedaRoleGranter.sol";
 import {
-    VedaForwardingSolverDeployer,
-    VedaLockstepEngineDeployer
+    VedaEngineDeployer,
+    VedaForwardingSolverDeployer
 } from "../../../src/earn/engines/veda/shared/VedaStackDeployers.sol";
 import { VedaStackFactory } from "../../../src/earn/engines/veda/shared/VedaStackFactory.sol";
-import { VedaTellerLister } from "../../../src/earn/engines/veda/shared/VedaTellerLister.sol";
-import { VedaVaultAccessRegistry } from "../../../src/earn/engines/veda/shared/VedaVaultAccessRegistry.sol";
 import { VedaVaultRegistry } from "../../../src/earn/engines/veda/shared/VedaVaultRegistry.sol";
 import { DistributorConfig } from "../../../src/interfaces/earn/EarnVaultTypes.sol";
-import {
-    IVedaStackAccess,
-    IVedaStackAuthorizer,
-    IVedaTellerLister,
-    IVedaVaultRegistry
-} from "../../../src/interfaces/earn/engines/IVedaVaultRegistry.sol";
+import { IVedaStackAuthorizer, IVedaVaultRegistry } from "../../../src/interfaces/earn/engines/IVedaVaultRegistry.sol";
 import { TIP403_REGISTRY_ADDRESS } from "../../../src/interfaces/external/tempo/ITIP403Registry.sol";
 import { IAccountant } from "../../../src/interfaces/external/veda/IAccountant.sol";
 import { IBoringQueue } from "../../../src/interfaces/external/veda/IBoringQueue.sol";
@@ -54,8 +46,9 @@ import { StackMockShareToken, StackMockTip20Factory, StackMockTip403Registry } f
 
 /// @dev A finalized Veda vault as it runs in production: no owner on the vault or its periphery, one
 ///      RolesAuthority owned by a timelock, and every gated function asking its own authority. On top
-///      of it, the canonical Earn core and a {VedaStackFactory}. The two concrete bases below differ only
-///      in how the factory's authorizations reach the Teller, Queue and stock solver.
+///      of it, the canonical Earn core, a {VedaRoleGranter} as the RolesAuthority's authority, and a
+///      {VedaStackFactory}. The two concrete bases below differ only in the kind of Teller the vault
+///      runs: one that gates its callers, or one that admits by account.
 abstract contract VedaStackTestBase is Test {
     uint64 internal constant MAX_RATE_AGE = 1 days;
 
@@ -69,6 +62,12 @@ abstract contract VedaStackTestBase is Test {
     uint8 internal constant LEGACY_ENGINE_ROLE = 12;
     uint8 internal constant PAUSER_ROLE = 14;
     uint8 internal constant PAUSE_ALL_ROLE = 16;
+    // The two roles the vault sets aside for Earn, used for nothing else.
+    uint8 internal constant EARN_ENGINE_ROLE = 40;
+    uint8 internal constant EARN_FORWARDER_ROLE = 41;
+    /// @dev Held by the granter alone, on a vault whose Teller admits by account: `setAllowedAccounts`
+    /// on the Teller and nothing else.
+    uint8 internal constant LISTER_ROLE = 42;
 
     /// @dev The timelock: owns the RolesAuthority and holds the owner role.
     address internal admin = makeAddr("timelock");
@@ -97,40 +96,79 @@ abstract contract VedaStackTestBase is Test {
     VedaVaultRegistry internal registry;
     EarnFactory internal earnFactory;
     StackMockTip20Factory internal tip20Factory;
-    VedaLockstepEngineDeployer internal engineDeployer;
+    VedaEngineDeployer internal engineDeployer;
     VedaForwardingSolverDeployer internal forwarderDeployer;
-    IVedaStackAuthorizer internal authorizer;
-    /// @dev Zero unless a variant's Teller keeps an account allowlist.
-    IVedaTellerLister internal tellerLister;
+    VedaRoleGranter internal granter;
     VedaStackFactory internal factory;
     uint256 private _jobCount;
 
     function setUp() public virtual {
         _deployVeda();
         _deployEarnCore();
-        registry = _newRegistry();
+        registry = new VedaVaultRegistry(IBoringVault(address(vault)), address(asset));
         _publish(teller, queue, solver);
-        engineDeployer = new VedaLockstepEngineDeployer();
+        engineDeployer = new VedaEngineDeployer();
         forwarderDeployer = new VedaForwardingSolverDeployer();
-        _deployAuthorizerAndFactory();
+        _deployGranterAndFactory();
         _adminSetup();
     }
 
     // ------------------------------------------------------------------
-    // What a variant supplies
+    // Earn's side of the vault
     // ------------------------------------------------------------------
 
-    function _newRegistry() internal virtual returns (VedaVaultRegistry);
-
-    /// @dev Sets `authorizer` and `factory`. Anyone may deploy these; neither holds a permission yet.
-    function _deployAuthorizerAndFactory() internal virtual;
+    /// @dev Sets `granter` and `factory`. Anyone may deploy these; neither holds a permission yet.
+    function _deployGranterAndFactory() internal virtual {
+        granter = new VedaRoleGranter(
+            IRolesAuthority(address(rolesAuthority)),
+            IVedaVaultRegistry(address(registry)),
+            EARN_ENGINE_ROLE,
+            EARN_FORWARDER_ROLE
+        );
+        factory = new VedaStackFactory(_factoryConfig());
+    }
 
     /// @dev The vault administrator's one-time setup, after which stacks need no transaction from it.
-    function _adminSetup() internal virtual;
+    function _adminSetup() internal virtual {
+        vm.startPrank(admin);
+        _grantEarnRoleCapabilities(teller, queue, solver);
+        // The one change to the RolesAuthority itself: it now asks the granter about calls on itself.
+        rolesAuthority.setAuthority(address(granter));
+        granter.setFactory(address(factory), true);
+        _grantPauserCapabilities();
+        _adminSetupForTeller();
+        // The batch's last call names the registry it published on and the factory it named, and undoes
+        // the whole setup unless the granter serves both, could grant both roles, and agrees with the
+        // published Teller about its list.
+        granter.assertSetup(IVedaVaultRegistry(address(registry)), address(factory));
+        vm.stopPrank();
+    }
+
+    /// @dev Called as the administrator inside the setup batch: what this variant's Teller needs.
+    function _adminSetupForTeller() internal virtual { }
 
     /// @dev Called as the administrator before it publishes new modules: whatever lets the vault's Earn
     /// stacks use them. A zero Queue comes with a zero solver.
-    function _admitModules(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_) internal virtual;
+    function _admitModules(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_) internal virtual {
+        _grantEarnRoleCapabilities(teller_, queue_, solver_);
+    }
+
+    /// @dev Called as the administrator: what the two dedicated Earn roles may call, and nothing else.
+    function _grantEarnRoleCapabilities(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_) internal {
+        rolesAuthority.setRoleCapability(EARN_ENGINE_ROLE, address(teller_), ITeller.bulkDeposit.selector, true);
+        rolesAuthority.setRoleCapability(EARN_ENGINE_ROLE, address(teller_), ITeller.bulkWithdraw.selector, true);
+        if (address(queue_) != address(0)) {
+            rolesAuthority.setRoleCapability(
+                EARN_ENGINE_ROLE, address(queue_), IBoringQueue.requestOnChainWithdraw.selector, true
+            );
+            rolesAuthority.setRoleCapability(
+                EARN_ENGINE_ROLE, address(queue_), IBoringQueue.cancelOnChainWithdrawUsingRequestId.selector, true
+            );
+            rolesAuthority.setRoleCapability(
+                EARN_FORWARDER_ROLE, address(solver_), IBoringSolver.boringRedeemSolve.selector, true
+            );
+        }
+    }
 
     // ------------------------------------------------------------------
     // Fixture
@@ -222,15 +260,12 @@ abstract contract VedaStackTestBase is Test {
             ITeller(address(teller_)),
             IBoringQueue(address(queue_)),
             IAccountant(address(accountant)),
-            IBoringSolver(address(solver_)),
-            1,
-            type(uint256).max,
-            MAX_RATE_AGE
+            IBoringSolver(address(solver_))
         );
     }
 
     /// @dev A publication as the administrator runs it: the Veda-side roles of the new modules, the Earn
-    /// stacks' access to them, then the registry.
+    /// stacks' access to them, then the registry. No engine moves until its owner activates it.
     function _rotate(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_) internal {
         vm.startPrank(admin);
         _grantTellerVaultRoles(teller_);
@@ -243,8 +278,7 @@ abstract contract VedaStackTestBase is Test {
     function _factoryConfig() internal view returns (VedaStackFactory.Config memory) {
         return VedaStackFactory.Config({
             registry: IVedaVaultRegistry(address(registry)),
-            authorizer: authorizer,
-            tellerLister: tellerLister,
+            authorizer: IVedaStackAuthorizer(address(granter)),
             earnFactory: earnFactory,
             earnFactoryCodeHash: address(earnFactory).codehash,
             engineDeployer: engineDeployer,
@@ -266,8 +300,54 @@ abstract contract VedaStackTestBase is Test {
             rolesAuthority.setRoleCapability(role, address(factory), VedaStackFactory.revokeForwarder.selector, true);
             rolesAuthority.setRoleCapability(role, address(factory), VedaStackFactory.pauseRegistrations.selector, true);
             rolesAuthority.setRoleCapability(role, address(factory), VedaStackFactory.discardEngine.selector, true);
-            rolesAuthority.setRoleCapability(role, address(registry), VedaVaultRegistry.haltDeposits.selector, true);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // A Teller that admits by account
+    // ------------------------------------------------------------------
+
+    /// @dev Called as the administrator: opens a Teller's bulk paths to every caller, turns its list on
+    /// in both directions, lists the stock solver, which redeems every settled request, and binds the
+    /// Queue to that list. A zero Queue comes with a zero solver.
+    function _configureAllowlist(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_) internal {
+        AllowlistTeller listed = AllowlistTeller(address(teller_));
+        rolesAuthority.setRoleCapability(
+            OWNER_ROLE, address(listed), AllowlistTeller.setAllowlistEnabled.selector, true
+        );
+        rolesAuthority.setRoleCapability(
+            OWNER_ROLE, address(listed), ITellerAllowlist.setAllowedAccounts.selector, true
+        );
+        rolesAuthority.setPublicCapability(address(listed), ITeller.bulkDeposit.selector, true);
+        rolesAuthority.setPublicCapability(address(listed), ITeller.bulkWithdraw.selector, true);
+        listed.setAllowlistEnabled(true, true);
+        if (address(queue_) != address(0)) {
+            _list(listed, address(solver_));
+            rolesAuthority.setRoleCapability(OWNER_ROLE, address(queue_), AllowlistQueue.setTeller.selector, true);
+            AllowlistQueue(address(queue_)).setTeller(address(listed));
+        }
+    }
+
+    /// @dev Called as the administrator: lists one account directly, as the administrator always can.
+    function _list(AllowlistTeller teller_, address account) internal {
+        address[] memory accounts = new address[](1);
+        accounts[0] = account;
+        teller_.setAllowedAccounts(accounts, true);
+    }
+
+    /// @dev Called as the administrator: the one function the granter's lister role reaches on a Teller.
+    function _grantListerCapability(AuthedTeller teller_) internal {
+        rolesAuthority.setRoleCapability(
+            LISTER_ROLE, address(teller_), ITellerAllowlist.setAllowedAccounts.selector, true
+        );
+    }
+
+    /// @dev Anyone carries the vault's engines onto the Teller published now.
+    function _relist(address engine) internal returns (uint256 carried) {
+        address[] memory engines = new address[](1);
+        engines[0] = engine;
+        vm.prank(stranger);
+        return granter.relist(engines);
     }
 
     // ------------------------------------------------------------------
@@ -297,12 +377,22 @@ abstract contract VedaStackTestBase is Test {
 
     function _createStack(bytes32 deploymentId)
         internal
-        returns (VedaLockstepEngine engine, EarnVault earnVault, StackMockShareToken earnShare)
+        returns (VedaEngine engine, EarnVault earnVault, StackMockShareToken earnShare)
     {
         vm.prank(operator);
         (address engine_, address earnVault_, address earnShare_) =
             factory.createStack(_nextJob(), _engineParams(), _coreParams(deploymentId), address(0));
-        return (VedaLockstepEngine(engine_), EarnVault(earnVault_), StackMockShareToken(earnShare_));
+        return (VedaEngine(engine_), EarnVault(earnVault_), StackMockShareToken(earnShare_));
+    }
+
+    /// @dev The stack's owner moves its engine to the tuple published now, as it would in production:
+    /// with the EarnVault's deposits paused for the switch.
+    function _activate(VedaEngine engine, EarnVault earnVault) internal {
+        vm.startPrank(stackOwner);
+        earnVault.setDepositsPaused(true);
+        engine.syncVedaPeriphery(1, type(uint256).max);
+        earnVault.setDepositsPaused(false);
+        vm.stopPrank();
     }
 
     function _deposit(EarnVault earnVault, address account, uint256 assets) internal returns (uint256 earnShares) {
@@ -372,120 +462,15 @@ abstract contract VedaStackTestBase is Test {
     }
 }
 
-/// @dev Authorization through RolesAuthority roles: a {VedaRoleGranter} is the RolesAuthority's authority.
-abstract contract VedaRoleStackTestBase is VedaStackTestBase {
-    uint8 internal constant EARN_ENGINE_ROLE = 40;
-    uint8 internal constant EARN_FORWARDER_ROLE = 41;
-
-    VedaRoleGranter internal granter;
-
-    function _newRegistry() internal virtual override returns (VedaVaultRegistry) {
-        return new VedaVaultRegistry(IBoringVault(address(vault)), address(asset));
-    }
-
-    function _deployAuthorizerAndFactory() internal virtual override {
-        granter = new VedaRoleGranter(
-            IRolesAuthority(address(rolesAuthority)),
-            IVedaVaultRegistry(address(registry)),
-            EARN_ENGINE_ROLE,
-            EARN_FORWARDER_ROLE
-        );
-        authorizer = IVedaStackAuthorizer(address(granter));
-        factory = new VedaStackFactory(_factoryConfig());
-    }
-
-    function _adminSetup() internal virtual override {
-        vm.startPrank(admin);
-        _grantEarnRoleCapabilities(teller, queue, solver);
-        // The one change to the RolesAuthority itself: it now asks the granter about calls on itself.
-        rolesAuthority.setAuthority(address(granter));
-        granter.setFactory(address(factory), true);
-        _grantPauserCapabilities();
-        // The batch's last call names the registry it published on and the factory it named, and undoes
-        // the whole setup unless the granter serves both and could grant both roles.
-        granter.assertSetup(IVedaVaultRegistry(address(registry)), address(factory));
-        vm.stopPrank();
-    }
-
-    function _admitModules(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_) internal virtual override {
-        _grantEarnRoleCapabilities(teller_, queue_, solver_);
-    }
-
-    /// @dev Called as the administrator: what the two dedicated Earn roles may call, and nothing else.
-    function _grantEarnRoleCapabilities(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_) internal {
-        rolesAuthority.setRoleCapability(EARN_ENGINE_ROLE, address(teller_), ITeller.bulkDeposit.selector, true);
-        rolesAuthority.setRoleCapability(EARN_ENGINE_ROLE, address(teller_), ITeller.bulkWithdraw.selector, true);
-        if (address(queue_) != address(0)) {
-            rolesAuthority.setRoleCapability(
-                EARN_ENGINE_ROLE, address(queue_), IBoringQueue.requestOnChainWithdraw.selector, true
-            );
-            rolesAuthority.setRoleCapability(
-                EARN_ENGINE_ROLE, address(queue_), IBoringQueue.cancelOnChainWithdrawUsingRequestId.selector, true
-            );
-            rolesAuthority.setRoleCapability(
-                EARN_FORWARDER_ROLE, address(solver_), IBoringSolver.boringRedeemSolve.selector, true
-            );
-        }
-    }
-}
-
-/// @dev Authorization through a read-only {VedaAuthorityOverlay} over a {VedaVaultAccessRegistry}:
-///      nothing writes to the RolesAuthority.
-abstract contract VedaOverlayStackTestBase is VedaStackTestBase {
-    VedaVaultAccessRegistry internal accessRegistry;
-    VedaAuthorityOverlay internal overlay;
-
-    function _newRegistry() internal override returns (VedaVaultRegistry) {
-        accessRegistry = new VedaVaultAccessRegistry(IBoringVault(address(vault)), address(asset));
-        return accessRegistry;
-    }
-
-    function _deployAuthorizerAndFactory() internal override {
-        authorizer = IVedaStackAuthorizer(address(accessRegistry));
-        factory = new VedaStackFactory(_factoryConfig());
-        // Anyone may have the registry create its overlay; the administrator only binds it.
-        vm.prank(stranger);
-        overlay = VedaAuthorityOverlay(accessRegistry.createOverlay());
-    }
-
-    function _adminSetup() internal override {
-        vm.startPrank(admin);
-        // Three live contracts are repointed; the BoringVault keeps the RolesAuthority.
-        teller.setAuthority(address(overlay));
-        queue.setAuthority(address(overlay));
-        solver.setAuthority(address(overlay));
-        accessRegistry.setOverlay(address(overlay));
-        accessRegistry.setFactory(address(factory), true);
-        _grantPauserCapabilities();
-        vm.stopPrank();
-    }
-
-    function _admitModules(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_) internal override {
-        _pointAtOverlay(address(teller_));
-        if (address(queue_) != address(0)) {
-            _pointAtOverlay(address(queue_));
-            _pointAtOverlay(address(solver_));
-        }
-    }
-
-    /// @dev Called as the administrator, through its owner role, as on a finalized module.
-    function _pointAtOverlay(address module) internal {
-        if (IAuth(module).authority() == address(overlay)) return;
-        rolesAuthority.setRoleCapability(OWNER_ROLE, module, IAuth.setAuthority.selector, true);
-        IAuth(module).setAuthority(address(overlay));
-    }
-}
+/// @dev A vault whose Teller, Queue and stock solver gate their callers: the engine role's capabilities
+///      are what admit an engine, and the granter's allowlist flag stays clear.
+abstract contract VedaRoleStackTestBase is VedaStackTestBase { }
 
 /// @dev A vault whose Teller is open to every caller and admits by account instead: both bulk paths
 ///      are public, the Teller enforces its allowlist in both directions, and its Queue applies the same
-///      list to request owners. A {VedaTellerLister} puts each engine on the list as the factory builds
-///      it. The Queue and the stock solver still gate callers, so the role granter serves those.
-abstract contract VedaAllowlistStackTestBase is VedaRoleStackTestBase {
-    /// @dev Held by the lister alone: `setAllowedAccounts` on the Teller and nothing else.
-    uint8 internal constant LISTER_ROLE = 42;
-
-    VedaTellerLister internal lister;
-
+///      list to request owners. The granter's allowlist flag is set, so it puts each engine on the list
+///      as the factory builds it. The Queue and the stock solver still gate callers through the roles.
+abstract contract VedaAllowlistStackTestBase is VedaStackTestBase {
     function _newTeller() internal virtual override returns (AuthedTeller) {
         return new AllowlistTeller(address(0), address(rolesAuthority), vault, address(accountant));
     }
@@ -498,64 +483,17 @@ abstract contract VedaAllowlistStackTestBase is VedaRoleStackTestBase {
         _configureAllowlist(teller, queue, solver);
     }
 
-    /// @dev Called as the administrator: opens a Teller's bulk paths to every caller, turns its list on
-    /// in both directions, lists the stock solver, which redeems every settled request, and binds the
-    /// Queue to that list. A zero Queue comes with a zero solver.
-    function _configureAllowlist(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_) internal {
-        AllowlistTeller listed = AllowlistTeller(address(teller_));
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(listed), AllowlistTeller.setAllowlistEnabled.selector, true
-        );
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(listed), ITellerAllowlist.setAllowedAccounts.selector, true
-        );
-        rolesAuthority.setPublicCapability(address(listed), ITeller.bulkDeposit.selector, true);
-        rolesAuthority.setPublicCapability(address(listed), ITeller.bulkWithdraw.selector, true);
-        listed.setAllowlistEnabled(true, true);
-        if (address(queue_) != address(0)) {
-            _list(listed, address(solver_));
-            rolesAuthority.setRoleCapability(OWNER_ROLE, address(queue_), AllowlistQueue.setTeller.selector, true);
-            AllowlistQueue(address(queue_)).setTeller(address(listed));
-        }
-    }
-
-    /// @dev Called as the administrator: lists one account directly, as the administrator always can.
-    function _list(AllowlistTeller teller_, address account) internal {
-        address[] memory accounts = new address[](1);
-        accounts[0] = account;
-        teller_.setAllowedAccounts(accounts, true);
-    }
-
-    function _deployAuthorizerAndFactory() internal override {
-        lister = new VedaTellerLister(IVedaVaultRegistry(address(registry)));
-        tellerLister = IVedaTellerLister(address(lister));
-        super._deployAuthorizerAndFactory();
-    }
-
-    function _adminSetup() internal override {
-        super._adminSetup();
-        vm.startPrank(admin);
+    function _adminSetupForTeller() internal virtual override {
         _grantListerCapability(teller);
-        rolesAuthority.setUserRole(address(lister), LISTER_ROLE, true);
-        lister.setFactory(address(factory), true);
-        // As with the granter: the batch's last call undoes it unless the lister serves this registry
-        // and this factory and can write the published Teller's list.
-        lister.assertSetup(IVedaVaultRegistry(address(registry)), address(factory));
-        vm.stopPrank();
+        rolesAuthority.setUserRole(address(granter), LISTER_ROLE, true);
+        granter.setTellerAllowlist(true);
     }
 
-    function _admitModules(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_) internal override {
+    function _admitModules(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_) internal virtual override {
         super._admitModules(teller_, queue_, solver_);
         if (!AllowlistTeller(address(teller_)).depositAllowlistEnabled()) {
             _configureAllowlist(teller_, queue_, solver_);
         }
         _grantListerCapability(teller_);
-    }
-
-    /// @dev Called as the administrator: the one function the lister's role reaches on a Teller.
-    function _grantListerCapability(AuthedTeller teller_) internal {
-        rolesAuthority.setRoleCapability(
-            LISTER_ROLE, address(teller_), ITellerAllowlist.setAllowedAccounts.selector, true
-        );
     }
 }

@@ -1,21 +1,20 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.36;
 
-// The stack factory, exercised over a finalized Veda vault and the canonical Earn core. Every test
-// in the behavior contract runs twice: once with role-granter authorization and once with the
-// read-only overlay.
+// The stack factory, exercised over a finalized Veda vault whose modules gate their callers, the
+// canonical Earn core and the released `VedaEngine`. `VedaRoleGranterAllowlist.t.sol` covers a vault
+// whose Teller admits by account.
 // forge-lint: disable-start(multi-contract-file)
 import { EarnFactory } from "../../../../../src/earn/core/EarnFactory.sol";
 import { EarnVault } from "../../../../../src/earn/core/EarnVault.sol";
 import { IForwardingEngine, VedaForwardingSolver } from "../../../../../src/earn/engines/veda/VedaForwardingSolver.sol";
-import { VedaLockstepEngine } from "../../../../../src/earn/engines/veda/shared/VedaLockstepEngine.sol";
+import { VedaEngine } from "../../../../../src/earn/engines/veda/VedaEngine.sol";
 import { VedaRoleGranter } from "../../../../../src/earn/engines/veda/shared/VedaRoleGranter.sol";
 import {
     VedaForwardingSolverDeployer,
-    VedaLockstepEngineDeployer
+    VedaEngineDeployer
 } from "../../../../../src/earn/engines/veda/shared/VedaStackDeployers.sol";
 import { VedaStackFactory } from "../../../../../src/earn/engines/veda/shared/VedaStackFactory.sol";
-import { VedaVaultAccessRegistry } from "../../../../../src/earn/engines/veda/shared/VedaVaultAccessRegistry.sol";
 import { VedaVaultRegistry } from "../../../../../src/earn/engines/veda/shared/VedaVaultRegistry.sol";
 import { IEarnEngineAsyncRedeem } from "../../../../../src/interfaces/earn/engines/IEarnEngineAsyncRedeem.sol";
 import {
@@ -28,13 +27,10 @@ import { IBoringSolver } from "../../../../../src/interfaces/external/veda/IBori
 import { IBoringVault } from "../../../../../src/interfaces/external/veda/IBoringVault.sol";
 import { IRolesAuthority } from "../../../../../src/interfaces/external/veda/IRolesAuthority.sol";
 import { ITeller } from "../../../../../src/interfaces/external/veda/ITeller.sol";
+import { IVedaPeripheryRegistry } from "../../../../../src/interfaces/external/veda/IVedaPeripheryRegistry.sol";
 import { AuthedBoringVault, AuthedQueue, AuthedSolver, AuthedTeller } from "../../../helpers/VedaAuthMocks.sol";
 import { StackMockShareToken, StackMockTip403Registry } from "../../../helpers/VedaStackMocks.sol";
-import {
-    VedaOverlayStackTestBase,
-    VedaRoleStackTestBase,
-    VedaStackTestBase
-} from "../../../helpers/VedaStackTestBase.sol";
+import { VedaRoleStackTestBase, VedaStackTestBase } from "../../../helpers/VedaStackTestBase.sol";
 
 /// @dev An engine deployer that returns whatever it is told to, standing for a factory pinned to the
 ///      wrong deployer.
@@ -45,7 +41,7 @@ contract HostileEngineDeployer {
         next = next_;
     }
 
-    function deploy(IVedaVaultRegistry, address, uint64, string calldata, string calldata)
+    function deploy(IVedaPeripheryRegistry, address, uint64, string calldata, string calldata)
         external
         view
         returns (address)
@@ -114,7 +110,10 @@ contract ReentrantOperator {
         );
     }
 
-    function deploy(IVedaVaultRegistry, address, uint64, string calldata, string calldata) external returns (address) {
+    function deploy(IVedaPeripheryRegistry, address, uint64, string calldata, string calldata)
+        external
+        returns (address)
+    {
         factory.deployEngine(
             keccak256("inner"), VedaStackFactory.EngineParams({ name: "V", symbol: "v", maxRateAge: 1 days })
         );
@@ -142,7 +141,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     // ------------------------------------------------------------------
 
     function testCreateStackBuildsBindsAuthorizesAndRecordsInOneOperatorCall() public {
-        (VedaLockstepEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
+        (VedaEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
         VedaStackFactory.StackRecord memory record = factory.stack(address(engine));
 
         // The canonical core, bound both ways, and handed to the stack's owner in the same call.
@@ -152,7 +151,12 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         assertEq(earnVault.operator(), stackOwner);
         assertEq(engine.owner(), stackOwner);
         assertEq(engine.pendingOwner(), address(0));
-        assertEq(address(engine.vaultRegistry()), address(registry));
+        // The released engine, on the vault's registry and the tuple published when it was built.
+        assertEq(address(engine.peripheryRegistry()), address(registry));
+        assertEq(address(engine.teller()), address(teller));
+        assertEq(address(engine.queue()), address(queue));
+        assertEq(address(engine.accountant()), address(accountant));
+        assertEq(engine.peripheryVersion(), registry.version());
         assertEq(earnShare.name(), "Veda Vault (Earn)");
         assertEq(earnShare.symbol(), "vVAULTE");
 
@@ -197,7 +201,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     }
 
     function testStackServesDepositsInstantExitsAndQueuedExitsEndToEnd() public {
-        (VedaLockstepEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
+        (VedaEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
 
         assertEq(_deposit(earnVault, user, 100e6), 100e6);
         assertEq(vault.balanceOf(address(engine)), 100e6);
@@ -226,7 +230,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     }
 
     function testQueuedExitCanBeCancelled() public {
-        (VedaLockstepEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
+        (VedaEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
         _deposit(earnVault, user, 100e6);
         bytes32 requestId = _requestRedeem(earnVault, earnShare, user, 25e6);
 
@@ -245,8 +249,8 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         // Between the two halves: owned by the factory, bound to nothing, authorized for nothing.
         VedaStackFactory.StackRecord memory pending = factory.stack(engine);
         assertEq(uint256(pending.status), uint256(VedaStackFactory.EngineStatus.Pending));
-        assertEq(VedaLockstepEngine(engine).owner(), address(factory));
-        assertEq(VedaLockstepEngine(engine).earnVault(), address(0));
+        assertEq(VedaEngine(engine).owner(), address(factory));
+        assertEq(VedaEngine(engine).earnVault(), address(0));
         assertFalse(_canCall(engine, address(teller), ITeller.bulkDeposit.selector));
         assertFalse(_canCall(engine, address(teller), ITeller.bulkWithdraw.selector));
         assertFalse(_canCall(engine, address(queue), IBoringQueue.requestOnChainWithdraw.selector));
@@ -258,8 +262,8 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         assertEq(uint256(record.status), uint256(VedaStackFactory.EngineStatus.Active));
         assertEq(record.earnVault, earnVault);
         assertEq(record.earnShare, earnShare);
-        assertEq(VedaLockstepEngine(engine).owner(), stackOwner);
-        assertEq(VedaLockstepEngine(engine).earnVault(), earnVault);
+        assertEq(VedaEngine(engine).owner(), stackOwner);
+        assertEq(VedaEngine(engine).earnVault(), earnVault);
         assertEq(factory.engineCount(), 1);
         assertEq(_deposit(EarnVault(earnVault), user, 10e6), 10e6);
     }
@@ -268,13 +272,13 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         // Anyone can use the public deployer, even naming the factory as owner. The factory still
         // refuses the result: it authorizes only engines it deployed in its own call.
         address foreign = engineDeployer.deploy(
-            IVedaVaultRegistry(address(registry)), address(factory), MAX_RATE_AGE, "Veda Vault", "vVAULT"
+            IVedaPeripheryRegistry(address(registry)), address(factory), MAX_RATE_AGE, "Veda Vault", "vVAULT"
         );
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotPending.selector, foreign));
         factory.finalizeStack(foreign, _coreParams(STACK_A), address(0));
 
-        (VedaLockstepEngine engine,,) = _createStack(STACK_A);
+        (VedaEngine engine,,) = _createStack(STACK_A);
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotPending.selector, address(engine)));
         factory.finalizeStack(address(engine), _coreParams(STACK_B), address(0));
@@ -293,8 +297,8 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         factory.finalizeStack(engine, bad, address(0));
 
         assertEq(uint256(factory.stack(engine).status), uint256(VedaStackFactory.EngineStatus.Pending));
-        assertEq(VedaLockstepEngine(engine).owner(), address(factory));
-        assertEq(VedaLockstepEngine(engine).earnVault(), address(0));
+        assertEq(VedaEngine(engine).owner(), address(factory));
+        assertEq(VedaEngine(engine).earnVault(), address(0));
         assertFalse(_canCall(engine, address(teller), ITeller.bulkDeposit.selector));
 
         vm.prank(operator);
@@ -326,7 +330,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     function testOnlyTheOperatorBuilds() public {
         vm.prank(operator);
         address pendingEngine = factory.deployEngine(_nextJob(), _engineParams());
-        (VedaLockstepEngine engine,,) = _createStack(STACK_A);
+        (VedaEngine engine,,) = _createStack(STACK_A);
 
         address[4] memory callers = [stranger, admin, pauser, stackOwner];
         for (uint256 i = 0; i < callers.length; i++) {
@@ -344,24 +348,62 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         }
     }
 
-    function testStacksOnOneVaultAreSeparateAndFollowAPublicationTogether() public {
-        (VedaLockstepEngine engineA, EarnVault vaultA,) = _createStack(STACK_A);
-        (VedaLockstepEngine engineB, EarnVault vaultB,) = _createStack(STACK_B);
+    function testStacksOnOneVaultAreSeparateAndEachOwnerActivatesAPublication() public {
+        (VedaEngine engineA, EarnVault vaultA,) = _createStack(STACK_A);
+        (VedaEngine engineB, EarnVault vaultB,) = _createStack(STACK_B);
         assertTrue(address(engineA) != address(engineB));
         _deposit(vaultA, user, 10e6);
         _deposit(vaultB, user, 20e6);
         assertEq(vault.balanceOf(address(engineA)), 10e6);
         assertEq(vault.balanceOf(address(engineB)), 20e6);
 
-        // One publication by the administrator; neither stack's owner does anything.
+        // One publication by the administrator moves neither stack: each keeps working on the Teller
+        // it was built on, which the administrator leaves live.
+        AuthedTeller newTeller = new AuthedTeller(address(0), address(rolesAuthority), vault, address(accountant));
+        _rotate(newTeller, queue, solver);
+        _deposit(vaultA, user, 1e6);
+        _deposit(vaultB, user, 1e6);
+        assertEq(newTeller.bulkDepositCalls(), 0);
+        assertTrue(factory.isEngineReady(address(engineA)));
+
+        // One owner activates it, as for any `VedaEngine`; the other stack is untouched.
+        _activate(engineA, vaultA);
+        _deposit(vaultA, user, 1e6);
+        _deposit(vaultB, user, 1e6);
+        assertEq(newTeller.bulkDepositCalls(), 1);
+        assertEq(address(engineA.teller()), address(newTeller));
+        assertEq(address(engineB.teller()), address(teller));
+        assertEq(engineA.peripheryVersion(), registry.version());
+        assertTrue(factory.isEngineReady(address(engineA)));
+        assertTrue(factory.isEngineReady(address(engineB)));
+
+        // A stack built now starts on the published tuple.
+        (VedaEngine engineC,,) = _createStack(keccak256("stack-c"));
+        assertEq(address(engineC.teller()), address(newTeller));
+    }
+
+    function testAnEngineLeftPendingAcrossAPublicationIsNeverBound() public {
+        vm.prank(operator);
+        address stale = factory.deployEngine(_nextJob(), _engineParams());
         AuthedTeller newTeller = new AuthedTeller(address(0), address(rolesAuthority), vault, address(accountant));
         _rotate(newTeller, queue, solver);
 
-        _deposit(vaultA, user, 1e6);
-        _deposit(vaultB, user, 1e6);
-        assertEq(newTeller.bulkDepositCalls(), 2);
-        assertEq(address(engineA.teller()), address(newTeller));
-        assertEq(address(engineB.teller()), address(newTeller));
+        // The engine fixed the earlier Teller when it was deployed, and only its final owner could
+        // move it, so the factory does not hand over a stack that starts on replaced modules.
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EnginePeripheryStale.selector, stale, 1, 2));
+        factory.finalizeStack(stale, _coreParams(STACK_A), address(0));
+        assertEq(uint256(factory.stack(stale).status), uint256(VedaStackFactory.EngineStatus.Pending));
+        assertEq(VedaEngine(stale).earnVault(), address(0));
+        assertFalse(rolesAuthority.doesUserHaveRole(stale, EARN_ENGINE_ROLE));
+
+        // A new engine under a new job id takes its place.
+        vm.startPrank(operator);
+        address fresh = factory.deployEngine(_nextJob(), _engineParams());
+        factory.finalizeStack(fresh, _coreParams(STACK_A), address(0));
+        vm.stopPrank();
+        assertEq(address(VedaEngine(fresh).teller()), address(newTeller));
+        assertTrue(factory.isEngineReady(fresh));
     }
 
     function testAJobIdBuildsOneEngineHoweverOftenItIsSent() public {
@@ -405,7 +447,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         bytes32 job = keccak256("job-one");
         vm.prank(operator);
         address pending = factory.deployEngine(job, _engineParams());
-        (VedaLockstepEngine active,,) = _createStack(STACK_A);
+        (VedaEngine active,,) = _createStack(STACK_A);
 
         address[3] memory nonPausers = [stranger, operator, stackOwner];
         for (uint256 i = 0; i < nonPausers.length; i++) {
@@ -434,7 +476,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotRevoked.selector, pending));
         factory.reinstateEngine(pending);
         assertFalse(_canCall(pending, address(teller), ITeller.bulkDeposit.selector));
-        assertEq(VedaLockstepEngine(pending).earnVault(), address(0));
+        assertEq(VedaEngine(pending).earnVault(), address(0));
     }
 
     function testAJobWhoseBuildRevertedCanBeSentAgain() public {
@@ -447,85 +489,6 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         vm.prank(operator);
         (address engine,,) = factory.createStack(job, _engineParams(), _coreParams(STACK_A), address(0));
         assertEq(factory.engineOf(job), engine);
-    }
-
-    // ------------------------------------------------------------------
-    // The vault's own deposit halt
-    // ------------------------------------------------------------------
-
-    function testPausersHaltOneStacksDepositsAndEveryExitKeepsWorking() public {
-        (VedaLockstepEngine engineA, EarnVault vaultA, StackMockShareToken shareA) = _createStack(STACK_A);
-        (VedaLockstepEngine engineB, EarnVault vaultB,) = _createStack(STACK_B);
-        _deposit(vaultA, user, 100e6);
-        bytes32 queuedBefore = _requestRedeem(vaultA, shareA, user, 10e6);
-
-        address[3] memory nonPausers = [stranger, operator, stackOwner];
-        for (uint256 i = 0; i < nonPausers.length; i++) {
-            vm.prank(nonPausers[i]);
-            vm.expectRevert(abi.encodeWithSelector(VedaVaultRegistry.NotPauser.selector, nonPausers[i]));
-            registry.haltDeposits(address(engineA));
-        }
-        vm.prank(pauser);
-        registry.haltDeposits(address(engineA));
-        assertTrue(registry.depositsHalted(address(engineA)));
-        // The halt is the registry's to report; the Veda modules still serve the engine.
-        assertTrue(factory.isEngineReady(address(engineA)));
-
-        // Deposits into this stack stop, and its owner cannot bring them back.
-        asset.mint(user, 2e6);
-        vm.startPrank(user);
-        asset.approve(address(vaultA), 2e6);
-        vm.expectRevert(VedaLockstepEngine.DepositsHalted.selector);
-        vaultA.deposit(1e6, user, 1);
-        vm.stopPrank();
-        vm.startPrank(stackOwner);
-        vaultA.setDepositsPaused(false);
-        vm.expectRevert(abi.encodeWithSelector(VedaVaultRegistry.NotVaultAdmin.selector, stackOwner));
-        registry.resumeDeposits(address(engineA));
-        vm.stopPrank();
-        vm.prank(pauser);
-        vm.expectRevert(abi.encodeWithSelector(VedaVaultRegistry.NotVaultAdmin.selector, pauser));
-        registry.resumeDeposits(address(engineA));
-        vm.prank(user);
-        vm.expectRevert(VedaLockstepEngine.DepositsHalted.selector);
-        vaultA.deposit(1e6, user, 1);
-
-        // Nor can shares be minted straight to the engine: here only the vault's engines may call the
-        // Teller's bulk deposit, and this engine's own deposit is the halted one.
-        vm.startPrank(stackOwner);
-        vm.expectRevert(bytes("UNAUTHORIZED"));
-        teller.bulkDeposit(address(asset), 1e6, 0, address(engineA));
-        vm.stopPrank();
-
-        // Every exit keeps working: instant, a request already queued, a new request, a cancellation.
-        vm.startPrank(user);
-        shareA.approve(address(vaultA), 20e6);
-        assertEq(vaultA.redeem(20e6, receiver, 20e6), 20e6);
-        vm.stopPrank();
-        VedaForwardingSolver forwarder = VedaForwardingSolver(factory.stack(address(engineA)).forwarder);
-        assertEq(_solve(forwarder, queuedBefore), 1);
-        bytes32 queuedAfter = _requestRedeem(vaultA, shareA, user, 5e6);
-        bytes32 cancelled = _requestRedeem(vaultA, shareA, user, 5e6);
-        vm.prank(user);
-        vaultA.cancelRedeem(cancelled, 1);
-        assertEq(_solve(forwarder, queuedAfter), 1);
-        assertEq(asset.balanceOf(user), 2e6 + 10e6 + 5e6);
-
-        // Another stack on the vault is untouched.
-        assertEq(_deposit(vaultB, user, 3e6), 3e6);
-        assertFalse(registry.depositsHalted(address(engineB)));
-
-        // Only the administrator lets deposits back in.
-        vm.prank(admin);
-        registry.resumeDeposits(address(engineA));
-        assertFalse(registry.depositsHalted(address(engineA)));
-        vm.prank(user);
-        assertEq(vaultA.deposit(1e6, user, 1), 1e6);
-
-        // The administrator may halt too.
-        vm.prank(admin);
-        registry.haltDeposits(address(engineB));
-        assertTrue(registry.depositsHalted(address(engineB)));
     }
 
     // ------------------------------------------------------------------
@@ -557,7 +520,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     }
 
     function testAFactoryOnAnotherRegistryOfTheSameVaultCannotBeNamed() public {
-        // Engines read their registry for every module, so a factory building on a registry the
+        // An engine takes its modules from its registry, so a factory building on a registry the
         // administrator never published on must not receive the vault's authorizations.
         VedaStackFactory.Config memory config = _factoryConfig();
         config.registry = IVedaVaultRegistry(address(_newLookalikeRegistry()));
@@ -570,7 +533,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     }
 
     function testASecondFactoryBuildsNewStacksWhileTheFirstStillServesItsOwn() public {
-        (VedaLockstepEngine first, EarnVault firstVault,) = _createStack(STACK_A);
+        (VedaEngine first, EarnVault firstVault,) = _createStack(STACK_A);
         VedaStackFactory second = new VedaStackFactory(_factoryConfig());
         vm.startPrank(admin);
         _nameFactory(second);
@@ -615,23 +578,22 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     function testFactoryRejectsAnEngineItsDeployerDidNotBuildForIt() public {
         HostileEngineDeployer hostile = new HostileEngineDeployer();
         VedaStackFactory.Config memory config = _factoryConfig();
-        config.engineDeployer = VedaLockstepEngineDeployer(address(hostile));
+        config.engineDeployer = VedaEngineDeployer(address(hostile));
         config.engineDeployerCodeHash = address(hostile).codehash;
         VedaStackFactory hostileFactory = new VedaStackFactory(config);
 
-        // Not a contract, owned by someone else, wired to another registry, or already bound.
+        // Not a contract, owned by someone else, already bound, or already one of its own stacks.
         address[4] memory candidates;
         candidates[0] = makeAddr("not a contract");
         candidates[1] = address(
-            new VedaLockstepEngine(IVedaVaultRegistry(address(registry)), stranger, MAX_RATE_AGE, "Veda Vault", "v")
+            new VedaEngine(IVedaPeripheryRegistry(address(registry)), stranger, MAX_RATE_AGE, "Veda Vault", "v")
         );
-        VedaLockstepEngine bound = new VedaLockstepEngine(
-            IVedaVaultRegistry(address(registry)), address(this), MAX_RATE_AGE, "Veda Vault", "v"
-        );
+        VedaEngine bound =
+            new VedaEngine(IVedaPeripheryRegistry(address(registry)), address(this), MAX_RATE_AGE, "Veda Vault", "v");
         bound.initializeEarnVault(makeAddr("some vault"));
         bound.transferOwnership(address(hostileFactory));
         candidates[2] = address(bound);
-        (VedaLockstepEngine live,,) = _createStack(STACK_A);
+        (VedaEngine live,,) = _createStack(STACK_A);
         candidates[3] = address(live);
 
         for (uint256 i = 0; i < candidates.length; i++) {
@@ -663,7 +625,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     }
 
     function testAReinstatedForwarderMustStillBeAllowedOnItsStockSolver() public {
-        (VedaLockstepEngine engine,,) = _createStack(STACK_A);
+        (VedaEngine engine,,) = _createStack(STACK_A);
         address forwarder = factory.stack(address(engine)).forwarder;
         vm.prank(pauser);
         factory.revokeForwarder(forwarder);
@@ -693,7 +655,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     function testBuildingCannotBeReentered() public {
         ReentrantOperator reentrant = new ReentrantOperator();
         VedaStackFactory.Config memory config = _factoryConfig();
-        config.engineDeployer = VedaLockstepEngineDeployer(address(reentrant));
+        config.engineDeployer = VedaEngineDeployer(address(reentrant));
         config.engineDeployerCodeHash = address(reentrant).codehash;
         config.operator = address(reentrant);
         VedaStackFactory guarded = new VedaStackFactory(config);
@@ -706,7 +668,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
 
     function testConstructorPinsItsWiringAndRejectsBadWiring() public {
         assertEq(address(factory.registry()), address(registry));
-        assertEq(address(factory.authorizer()), address(authorizer));
+        assertEq(address(factory.authorizer()), address(granter));
         assertEq(address(factory.earnFactory()), address(earnFactory));
         assertEq(factory.earnFactoryCodeHash(), address(earnFactory).codehash);
         assertEq(factory.engineDeployerCodeHash(), address(engineDeployer).codehash);
@@ -779,8 +741,14 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.InvalidFactoryWiring.selector, codeless));
         new VedaStackFactory(config);
 
+        // A factory always has a granter: nothing else admits its stacks.
         config = _factoryConfig();
-        config.engineDeployer = VedaLockstepEngineDeployer(codeless);
+        config.authorizer = IVedaStackAuthorizer(address(0));
+        vm.expectRevert(VedaStackFactory.ZeroAddress.selector);
+        new VedaStackFactory(config);
+
+        config = _factoryConfig();
+        config.engineDeployer = VedaEngineDeployer(codeless);
         vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.InvalidFactoryWiring.selector, codeless));
         new VedaStackFactory(config);
 
@@ -795,9 +763,9 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     // ------------------------------------------------------------------
 
     function testNothingTheFactoryBuildsOrUsesCanReachVaultCustody() public {
-        (VedaLockstepEngine engine,,) = _createStack(STACK_A);
+        (VedaEngine engine,,) = _createStack(STACK_A);
         address forwarder = factory.stack(address(engine)).forwarder;
-        address[5] memory accounts = [address(factory), address(authorizer), address(engine), forwarder, operator];
+        address[5] memory accounts = [address(factory), address(granter), address(engine), forwarder, operator];
         bytes4[] memory custody = _custodySelectors();
 
         // The BoringVault still answers to the RolesAuthority and to nothing else.
@@ -841,7 +809,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
 
     function testImmediateOnlyVaultGetsAStackWithoutAForwarderAndGainsQueuedExitsLater() public {
         _rotate(teller, AuthedQueue(address(0)), AuthedSolver(address(0)));
-        (VedaLockstepEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
+        (VedaEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
         assertEq(factory.stack(address(engine)).forwarder, address(0));
         assertFalse(engine.supportsInterface(type(IEarnEngineAsyncRedeem).interfaceId));
         _deposit(earnVault, user, 50e6);
@@ -850,9 +818,10 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         vm.expectRevert(VedaStackFactory.QueueUnavailable.selector);
         factory.deployForwarder(address(engine));
 
-        // The administrator publishes a Queue: the stack sees it at once and needs only a forwarder.
+        // The administrator publishes a Queue. The stack gains queued exits once the operator builds
+        // it a forwarder and its owner admits that and activates the publication.
         _rotate(teller, queue, solver);
-        assertTrue(engine.supportsInterface(type(IEarnEngineAsyncRedeem).interfaceId));
+        assertFalse(engine.supportsInterface(type(IEarnEngineAsyncRedeem).interfaceId));
 
         vm.prank(operator);
         address forwarder = factory.deployForwarder(address(engine));
@@ -865,6 +834,8 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         assertFalse(engine.authorizedForwarder(forwarder));
         vm.prank(stackOwner);
         engine.setAuthorizedForwarder(forwarder, true);
+        _activate(engine, earnVault);
+        assertTrue(engine.supportsInterface(type(IEarnEngineAsyncRedeem).interfaceId));
 
         bytes32 requestId = _requestRedeem(earnVault, earnShare, user, 20e6);
         assertEq(_solve(VedaForwardingSolver(forwarder), requestId), 1);
@@ -883,21 +854,23 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     }
 
     function testAQueueChangeKeepsOldRequestsSettlingAndNeedsANewForwarder() public {
-        (VedaLockstepEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
+        (VedaEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
         _deposit(earnVault, user, 100e6);
         bytes32 oldRequest = _requestRedeem(earnVault, earnShare, user, 10e6);
         VedaForwardingSolver oldForwarder = VedaForwardingSolver(factory.stack(address(engine)).forwarder);
 
         (AuthedQueue newQueue, AuthedSolver newSolver) = _newExitRail(address(accountant));
         _rotate(teller, newQueue, newSolver);
-        assertEq(address(engine.queue()), address(newQueue));
-        assertEq(engine.claimQueue(oldRequest), address(queue));
+        assertEq(address(engine.queue()), address(queue));
 
-        // New requests use the new Queue, which needs its own forwarder.
+        // The new Queue needs its own forwarder, which the owner admits as it activates the Queue.
         vm.prank(operator);
         address newForwarder = factory.deployForwarder(address(engine));
         vm.prank(stackOwner);
         engine.setAuthorizedForwarder(newForwarder, true);
+        _activate(engine, earnVault);
+        assertEq(address(engine.queue()), address(newQueue));
+        assertEq(engine.claimQueue(oldRequest), address(queue));
         skip(1);
         bytes32 newRequest = _requestRedeem(earnVault, earnShare, user, 15e6);
         assertEq(engine.claimQueue(newRequest), address(newQueue));
@@ -914,7 +887,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     // ------------------------------------------------------------------
 
     function testPausersRevokeAnEngineAndOnlyTheAdministratorReinstatesIt() public {
-        (VedaLockstepEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
+        (VedaEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
         _deposit(earnVault, user, 100e6);
         bytes32 requestId = _requestRedeem(earnVault, earnShare, user, 10e6);
 
@@ -969,8 +942,8 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     }
 
     function testAnotherStackIsUntouchedByARevocation() public {
-        (VedaLockstepEngine engineA,,) = _createStack(STACK_A);
-        (VedaLockstepEngine engineB, EarnVault vaultB,) = _createStack(STACK_B);
+        (VedaEngine engineA,,) = _createStack(STACK_A);
+        (VedaEngine engineB, EarnVault vaultB,) = _createStack(STACK_B);
         vm.prank(pauser);
         factory.revokeEngine(address(engineA));
 
@@ -979,7 +952,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     }
 
     function testPausersRevokeAForwarderAndOnlyTheAdministratorReinstatesIt() public {
-        (VedaLockstepEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
+        (VedaEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
         _deposit(earnVault, user, 100e6);
         bytes32 requestId = _requestRedeem(earnVault, earnShare, user, 10e6);
         VedaForwardingSolver forwarder = VedaForwardingSolver(factory.stack(address(engine)).forwarder);
@@ -1017,7 +990,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     function testPausersPauseRegistrationsAndOnlyTheAdministratorResumesThem() public {
         vm.prank(operator);
         address pendingEngine = factory.deployEngine(_nextJob(), _engineParams());
-        (VedaLockstepEngine engine,,) = _createStack(STACK_A);
+        (VedaEngine engine,,) = _createStack(STACK_A);
 
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.NotPauser.selector, operator));
@@ -1047,7 +1020,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     }
 
     function testTheAdministratorMayAlsoPauseAndRevoke() public {
-        (VedaLockstepEngine engine,,) = _createStack(STACK_A);
+        (VedaEngine engine,,) = _createStack(STACK_A);
         vm.startPrank(admin);
         factory.revokeEngine(address(engine));
         factory.revokeForwarder(factory.stack(address(engine)).forwarder);
@@ -1174,43 +1147,6 @@ contract VedaRoleStackFactoryTest is VedaRoleStackTestBase, VedaStackFactoryBeha
 
     function _newLookalikeRegistry() internal override returns (address) {
         return address(new VedaVaultRegistry(IBoringVault(address(vault)), address(asset)));
-    }
-}
-
-contract VedaOverlayStackFactoryTest is VedaOverlayStackTestBase, VedaStackFactoryBehavior {
-    function setUp() public override(VedaStackTestBase) {
-        super.setUp();
-    }
-
-    function _publishUnadmittedTeller(AuthedTeller unadmitted) internal override {
-        // With the overlay unbound, the registry no longer insists that a Teller answers to it.
-        vm.prank(admin);
-        accessRegistry.setOverlay(address(0));
-        _publish(unadmitted, queue, solver);
-    }
-
-    function _dropForwarderAccess() internal override {
-        // Publish another exit rail, then retire the one the forwarder is fixed to.
-        (AuthedQueue newQueue, AuthedSolver newSolver) = _newExitRail(address(accountant));
-        _rotate(teller, newQueue, newSolver);
-        vm.prank(admin);
-        accessRegistry.setSolverHonored(IBoringSolver(address(solver)), false);
-    }
-
-    function _nameFactory(VedaStackFactory other) internal override {
-        accessRegistry.setFactory(address(other), true);
-    }
-
-    function _unnameFactory(VedaStackFactory other) internal override {
-        accessRegistry.setFactory(address(other), false);
-    }
-
-    function _notWiredSelector() internal pure override returns (bytes4) {
-        return VedaVaultAccessRegistry.InvalidStackAccount.selector;
-    }
-
-    function _newLookalikeRegistry() internal override returns (address) {
-        return address(new VedaVaultAccessRegistry(IBoringVault(address(vault)), address(asset)));
     }
 }
 // forge-lint: disable-end(multi-contract-file)

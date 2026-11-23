@@ -9,7 +9,7 @@ import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { EarnVault } from "../../../../../src/earn/core/EarnVault.sol";
 import { IForwardingEngine, VedaForwardingSolver } from "../../../../../src/earn/engines/veda/VedaForwardingSolver.sol";
 import { VedaForwarderSteward } from "../../../../../src/earn/engines/veda/shared/VedaForwarderSteward.sol";
-import { VedaLockstepEngine } from "../../../../../src/earn/engines/veda/shared/VedaLockstepEngine.sol";
+import { VedaEngine } from "../../../../../src/earn/engines/veda/VedaEngine.sol";
 import { VedaStackFactory } from "../../../../../src/earn/engines/veda/shared/VedaStackFactory.sol";
 import { IBoringQueue } from "../../../../../src/interfaces/external/veda/IBoringQueue.sol";
 import { IBoringSolver } from "../../../../../src/interfaces/external/veda/IBoringSolver.sol";
@@ -40,7 +40,7 @@ contract VedaForwarderStewardTest is VedaRoleStackTestBase {
     // ------------------------------------------------------------------
 
     function testAForwarderIsBuiltWithTheVaultsSolverApprovedAndSettlesWithNoOwnerTransaction() public {
-        (VedaLockstepEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
+        (VedaEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
         VedaForwardingSolver forwarder = VedaForwardingSolver(factory.stack(address(engine)).forwarder);
 
         assertEq(forwarder.owner(), address(steward));
@@ -57,17 +57,20 @@ contract VedaForwarderStewardTest is VedaRoleStackTestBase {
     function testAForwarderBuiltLaterIsSeededToo() public {
         // A stack built before the vault had a Queue gets its forwarder afterwards.
         _rotate(teller, AuthedQueue(address(0)), AuthedSolver(address(0)));
-        (VedaLockstepEngine engine,,) = _createStack(STACK_A);
+        (VedaEngine engine, EarnVault earnVault,) = _createStack(STACK_A);
         assertEq(factory.stack(address(engine)).forwarder, address(0));
         _rotate(teller, queue, solver);
 
         vm.prank(operator);
         address forwarder = factory.deployForwarder(address(engine));
         assertTrue(VedaForwardingSolver(forwarder).isAuthorizedSolver(solverBot));
-        // Its engine's owner has not admitted it yet, and readiness says so.
+        // Its engine's owner has neither admitted it nor moved the engine to the Queue, and readiness
+        // says so until both are done.
         assertFalse(factory.isForwarderReady(forwarder, solverBot));
         vm.prank(stackOwner);
         engine.setAuthorizedForwarder(forwarder, true);
+        assertFalse(factory.isForwarderReady(forwarder, solverBot));
+        _activate(engine, earnVault);
         assertTrue(factory.isForwarderReady(forwarder, solverBot));
     }
 
@@ -133,8 +136,8 @@ contract VedaForwarderStewardTest is VedaRoleStackTestBase {
     // ------------------------------------------------------------------
 
     function testTheListReachesEveryForwarderWithoutItsOwner() public {
-        (VedaLockstepEngine engineA, EarnVault vaultA, StackMockShareToken shareA) = _createStack(STACK_A);
-        (VedaLockstepEngine engineB,,) = _createStack(STACK_B);
+        (VedaEngine engineA, EarnVault vaultA, StackMockShareToken shareA) = _createStack(STACK_A);
+        (VedaEngine engineB,,) = _createStack(STACK_B);
         VedaForwardingSolver forwarderA = VedaForwardingSolver(factory.stack(address(engineA)).forwarder);
         VedaForwardingSolver forwarderB = VedaForwardingSolver(factory.stack(address(engineB)).forwarder);
 
@@ -177,7 +180,7 @@ contract VedaForwarderStewardTest is VedaRoleStackTestBase {
         assertEq(_trigger(forwarderA, secondBot, requestId), 1);
 
         // A stack built after the change gets the list as it is now.
-        (VedaLockstepEngine engineC,,) = _createStack(keccak256("stack-c"));
+        (VedaEngine engineC,,) = _createStack(keccak256("stack-c"));
         VedaForwardingSolver forwarderC = VedaForwardingSolver(factory.stack(address(engineC)).forwarder);
         assertTrue(forwarderC.isAuthorizedSolver(secondBot));
         assertFalse(forwarderC.isAuthorizedSolver(solverBot));
@@ -233,7 +236,7 @@ contract VedaForwarderStewardTest is VedaRoleStackTestBase {
     }
 
     function testItsOwnerKeepsTheForwardersOtherOwnerFunctions() public {
-        (VedaLockstepEngine engine,,) = _createStack(STACK_A);
+        (VedaEngine engine,,) = _createStack(STACK_A);
         VedaForwardingSolver forwarder = VedaForwardingSolver(factory.stack(address(engine)).forwarder);
         address newTreasury = makeAddr("new treasury");
         address newOwner = makeAddr("new forwarder owner");
@@ -275,7 +278,7 @@ contract VedaForwarderStewardTest is VedaRoleStackTestBase {
     // ------------------------------------------------------------------
 
     function testReadinessFollowsEverythingAQueuedExitNeeds() public {
-        (VedaLockstepEngine engine,,) = _createStack(STACK_A);
+        (VedaEngine engine, EarnVault earnVault,) = _createStack(STACK_A);
         address forwarder = factory.stack(address(engine)).forwarder;
         assertTrue(factory.isForwarderReady(forwarder, solverBot));
         assertFalse(factory.isForwarderReady(stranger, solverBot));
@@ -304,20 +307,26 @@ contract VedaForwarderStewardTest is VedaRoleStackTestBase {
         rolesAuthority.setUserRole(forwarder, EARN_FORWARDER_ROLE, true);
         assertTrue(factory.isForwarderReady(forwarder, solverBot));
 
-        // The vault publishes another Queue: this forwarder is fixed to the old one, so the stack
-        // needs a new forwarder, admitted by its owner, before a new request can settle.
+        // The vault publishes another Queue. The engine keeps the old one until its owner activates
+        // the publication, so its forwarder is still the one that settles.
         (AuthedQueue newQueue, AuthedSolver newSolver) = _newExitRail(address(accountant));
         _rotate(teller, newQueue, newSolver);
-        assertFalse(factory.isForwarderReady(forwarder, solverBot));
+        assertTrue(factory.isForwarderReady(forwarder, solverBot));
         vm.prank(operator);
         address replacement = factory.deployForwarder(address(engine));
-        assertFalse(factory.isForwarderReady(replacement, solverBot));
         vm.prank(stackOwner);
         engine.setAuthorizedForwarder(replacement, true);
-        assertTrue(factory.isForwarderReady(replacement, solverBot));
+        assertFalse(factory.isForwarderReady(replacement, solverBot));
 
-        // An immediate-only vault has no queued path to be ready.
+        // Once the owner activates it, the replacement is what a new request needs.
+        _activate(engine, earnVault);
+        assertTrue(factory.isForwarderReady(replacement, solverBot));
+        assertFalse(factory.isForwarderReady(forwarder, solverBot));
+
+        // An engine moved to an immediate-only tuple has no queued path to be ready.
         _rotate(teller, AuthedQueue(address(0)), AuthedSolver(address(0)));
+        assertTrue(factory.isForwarderReady(replacement, solverBot));
+        _activate(engine, earnVault);
         assertFalse(factory.isForwarderReady(replacement, solverBot));
     }
 

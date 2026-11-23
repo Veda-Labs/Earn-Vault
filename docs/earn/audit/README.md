@@ -38,8 +38,8 @@ Neither report covers:
 
 - `PropAMMEngine`, which is experimental;
 - the [Veda shared-vault stack](../modules/veda-shared-stacks.md) contracts under
-  `src/earn/engines/veda/shared/`, including `VedaLockstepEngine`, which is derived from the reviewed
-  `VedaEngine` but is a separate, unreviewed contract;
+  `src/earn/engines/veda/shared/`, which deploy the reviewed `VedaEngine` and `VedaForwardingSolver`
+  unmodified on a registry, a factory and a role granter that are not reviewed;
 - `EarnRewardsFactory`, `EarnFactory`, and `ERC4626EngineFactory`;
 - the current Foundry deployment scripts and the profile lifecycle tooling;
 - the oracle and rebalance controller used with a DirectPropAMM pool; and

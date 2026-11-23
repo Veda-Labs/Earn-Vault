@@ -7,7 +7,7 @@ import { ITellerAllowlist } from "../../../../interfaces/external/veda/ITellerAl
 /// @notice Reads a Teller's account allowlist without assuming the Teller has one. Older Tellers gate
 ///         callers only, so every read reports whether the Teller answered in the expected shape.
 /// @dev Never reverts. A missing function, a revert, or anything but one ABI word holding 0 or 1 (or an
-///      address, for {tryQueueTeller}) is reported as unsupported. A caller that reads unsupported as
+///      address, for {tryTeller}) is reported as unsupported. A caller that reads unsupported as
 ///      "this Teller has no list" therefore also admits a Teller whose list cannot be read; the
 ///      modules read here are the ones the vault's administrator published.
 library VedaTellerAllowlist {
@@ -28,10 +28,11 @@ library VedaTellerAllowlist {
         return _tryBool(teller, abi.encodeCall(ITellerAllowlist.allowedAccounts, (account)));
     }
 
-    /// @notice The Teller whose allowlist `queue` applies to its request owners. Zero means the Queue
-    ///         checks no allowlist.
-    function tryQueueTeller(address queue) internal view returns (bool supported, address teller) {
-        (bool ok, uint256 word) = _tryWord(queue, abi.encodeWithSignature("teller()"));
+    /// @notice The Teller `holder` reports through `teller()`: for a Queue, the Teller whose allowlist
+    ///         it applies to its request owners, zero meaning it checks none; for an engine, the Teller
+    ///         it uses now.
+    function tryTeller(address holder) internal view returns (bool supported, address teller) {
+        (bool ok, uint256 word) = _tryWord(holder, abi.encodeWithSignature("teller()"));
         if (!ok || word > type(uint160).max) return (false, address(0));
         // Bounded above, so the downcast cannot truncate.
         // forge-lint: disable-next-line(unsafe-typecast)

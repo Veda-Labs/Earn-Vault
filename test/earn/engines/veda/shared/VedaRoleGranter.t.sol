@@ -6,7 +6,7 @@ pragma solidity ^0.8.36;
 // forge-lint: disable-start(multi-contract-file,unsafe-typecast)
 import { Test } from "forge-std/Test.sol";
 import { EarnFactory } from "../../../../../src/earn/core/EarnFactory.sol";
-import { VedaLockstepEngine } from "../../../../../src/earn/engines/veda/shared/VedaLockstepEngine.sol";
+import { VedaEngine } from "../../../../../src/earn/engines/veda/VedaEngine.sol";
 import { VedaRoleGranter } from "../../../../../src/earn/engines/veda/shared/VedaRoleGranter.sol";
 import { VedaStackFactory } from "../../../../../src/earn/engines/veda/shared/VedaStackFactory.sol";
 import { VedaVaultRegistry } from "../../../../../src/earn/engines/veda/shared/VedaVaultRegistry.sol";
@@ -401,6 +401,22 @@ contract VedaRoleGranterTest is VedaRoleStackTestBase {
         granter.setEngineAuthorized(grantee, false);
     }
 
+    function testARevocationTheRolesAuthorityRefusesRevertsWhenThereIsNoListingToRemove() public {
+        vm.prank(address(factory));
+        granter.setEngineAuthorized(grantee, true);
+        // The administrator cuts the granter off. On a Teller without a list the role is all there is
+        // to revoke, so a revocation that cannot clear it is not reported as done.
+        vm.prank(admin);
+        rolesAuthority.setAuthority(address(0));
+        vm.prank(address(factory));
+        vm.expectRevert(
+            abi.encodeWithSelector(VedaRoleGranter.RoleUpdateFailed.selector, grantee, EARN_ENGINE_ROLE, false)
+        );
+        granter.setEngineAuthorized(grantee, false);
+        assertTrue(rolesAuthority.doesUserHaveRole(grantee, EARN_ENGINE_ROLE));
+        assertEq(granter.listedOn(grantee), address(0));
+    }
+
     function _assertGrantRefusedWhileRoleReaches(address target, bytes4 functionSig) private {
         uint8[2] memory roles = [EARN_ENGINE_ROLE, EARN_FORWARDER_ROLE];
         for (uint256 i = 0; i < roles.length; i++) {
@@ -615,8 +631,8 @@ contract VedaRoleStackInvariantTest is VedaRoleStackTestBase {
             // An active engine is bound, handed over, and usable on the Teller; nothing else is.
             assertEq(_canCall(engine, address(teller), ITeller.bulkDeposit.selector), active);
             if (active) {
-                assertTrue(VedaLockstepEngine(engine).earnVault() != address(0));
-                assertTrue(VedaLockstepEngine(engine).owner() != address(factory));
+                assertTrue(VedaEngine(engine).earnVault() != address(0));
+                assertTrue(VedaEngine(engine).owner() != address(factory));
             }
         }
 
