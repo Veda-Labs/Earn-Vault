@@ -24,9 +24,8 @@ interface IVedaVaultRegistry {
     function isVaultAdmin(address account) external view returns (bool);
 }
 
-/// @notice The seam through which a {VedaStackFactory} authorizes the engines and forwarding solvers it
-///         builds. `VedaRoleGranter` implements it with RolesAuthority roles and, for a Teller that
-///         admits by account, a place on that Teller's list.
+/// @notice The seam through which a {VedaStackFactory} grants RolesAuthority roles to the engines
+///         and forwarding solvers it builds. Teller account admission is separate.
 interface IVedaStackAuthorizer {
     /// @notice Whether the vault's administrator has named `factory` as a caller the authorizer accepts.
     function isFactory(address factory) external view returns (bool);

@@ -8,7 +8,6 @@ import { IBoringSolver } from "../../../../interfaces/external/veda/IBoringSolve
 import { IBoringVault } from "../../../../interfaces/external/veda/IBoringVault.sol";
 import { IAuth, IAuthority, IBoringVaultCustody } from "../../../../interfaces/external/veda/IRolesAuthority.sol";
 import { ITeller } from "../../../../interfaces/external/veda/ITeller.sol";
-import { VedaTellerAllowlist } from "./VedaTellerAllowlist.sol";
 
 /// @title VedaVaultRegistry
 /// @notice Per-vault source of truth for the Teller, optional tracking Queue with its stock solver, and
@@ -26,10 +25,10 @@ import { VedaTellerAllowlist } from "./VedaTellerAllowlist.sol";
 ///      replaced Teller, Queue and solver must stay live until every engine has moved and every
 ///      request on the old Queue is closed. Publication checks what an engine does not: that the
 ///      Teller can already mint and burn the vault's shares, that a Queue comes with a stock solver,
-///      and, where the Teller keeps an account allowlist, that the Queue applies that Teller's list
-///      and the stock solver is on it. It cannot show that a module's bytecode is benign or that the
-///      Earn stacks hold their permissions on the new modules; those stay with the review of the
-///      publication.
+///      and that an optional Queue Teller pointer matches the published Teller. It cannot show that a
+///      module's bytecode is benign, that the Earn stacks hold permissions on
+///      the new modules, or that a separate account-admission policy accepts them. Those checks stay
+///      with the review of the publication.
 ///
 ///      IT BINDS NO ENGINE. See {engine}.
 contract VedaVaultRegistry is IVedaVaultRegistry {
@@ -48,7 +47,6 @@ contract VedaVaultRegistry is IVedaVaultRegistry {
 
     error InvalidVedaPeriphery(address account);
     error InvalidVedaPeripheryWiring(address component, address expected, address actual);
-    error SolverNotListedOnTeller(address solver, address teller);
     error NotVaultAdmin(address caller);
     error QueueSolverMismatch(address queue, address solver);
     error QueueTellerMismatch(address queue, address expected, address actual);
@@ -153,7 +151,10 @@ contract VedaVaultRegistry is IVedaVaultRegistry {
             _requireWiring(address(newQueue), expectedVault, newQueue.boringVault());
             _requireWiring(address(newQueue), address(newAccountant), newQueue.accountant());
             if (!newQueue.trackWithdrawsOnChain()) revert QueueTrackingDisabled(address(newQueue));
-            _requireAllowlistWiring(address(newTeller), address(newQueue), address(newSolver));
+            (bool hasTeller, address queueTeller) = _tryReadAddress(address(newQueue), bytes4(keccak256("teller()")));
+            if (hasTeller && queueTeller != address(0) && queueTeller != address(newTeller)) {
+                revert QueueTellerMismatch(address(newQueue), address(newTeller), queueTeller);
+            }
         }
         _requireWiring(address(newAccountant), expectedVault, newAccountant.vault());
         _requireWiring(address(newAccountant), baseAsset, newAccountant.base());
@@ -172,20 +173,6 @@ contract VedaVaultRegistry is IVedaVaultRegistry {
                 revert TellerNotAuthorizedOnVault(newTeller, vaultFunctions[i]);
             }
         }
-    }
-
-    /// @dev Where the Teller keeps an account allowlist: a Queue that checks one must check this
-    ///      Teller's, or it would settle against a list the vault's engines are not on, and the list
-    ///      must admit the stock solver, because the solver redeems every settled request through the
-    ///      Teller. A list that is not enforced admits every account.
-    ///      Modules that expose neither reading are taken to have no allowlist.
-    function _requireAllowlistWiring(address newTeller, address newQueue, address newSolver) private view {
-        (bool queueChecks, address queueTeller) = VedaTellerAllowlist.tryTeller(newQueue);
-        if (queueChecks && queueTeller != address(0) && queueTeller != newTeller) {
-            revert QueueTellerMismatch(newQueue, newTeller, queueTeller);
-        }
-        (bool tellerChecks, bool solverAllowed) = VedaTellerAllowlist.tryIsWithdrawAllowed(newTeller, newSolver);
-        if (tellerChecks && !solverAllowed) revert SolverNotListedOnTeller(newSolver, newTeller);
     }
 
     function _validateContract(address account) private view {

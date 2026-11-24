@@ -2,8 +2,8 @@
 pragma solidity ^0.8.36;
 
 // The stack factory, exercised over a finalized Veda vault whose modules gate their callers, the
-// canonical Earn core and the released `VedaEngine`. `VedaRoleGranterAllowlist.t.sol` covers a vault
-// whose Teller admits by account.
+// canonical Earn core and the released `VedaEngine`. `VedaRoleGranterAdmission.t.sol` covers a vault
+// whose Teller also admits by account.
 // forge-lint: disable-start(multi-contract-file)
 import { EarnFactory } from "../../../../../src/earn/core/EarnFactory.sol";
 import { EarnVault } from "../../../../../src/earn/core/EarnVault.sol";

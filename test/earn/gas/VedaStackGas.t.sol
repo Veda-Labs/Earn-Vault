@@ -84,8 +84,8 @@ contract VedaRoleStackGasAudit is VedaRoleStackTestBase, VedaStackGasAudit {
     }
 }
 
-/// @dev The role granter with its allowlist flag set, so that it also lists the engine, and a steward
-///      that approves one solver on each forwarding solver: everything a build can write.
+/// @dev A Teller with separate account admission and a steward that approves one solver on each
+///      forwarding solver. This measures role grant without Teller membership writes.
 contract VedaAllowlistStackGasAudit is VedaAllowlistStackTestBase, VedaStackGasAudit {
     function setUp() public override(VedaStackTestBase) {
         address[] memory solvers = new address[](1);
@@ -109,10 +109,6 @@ contract VedaAllowlistStackGasAudit is VedaAllowlistStackTestBase, VedaStackGasA
 
     function _configureVeda() internal override(VedaStackTestBase, VedaAllowlistStackTestBase) {
         super._configureVeda();
-    }
-
-    function _adminSetupForTeller() internal override(VedaStackTestBase, VedaAllowlistStackTestBase) {
-        super._adminSetupForTeller();
     }
 
     function _admitModules(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_)
