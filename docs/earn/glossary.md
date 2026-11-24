@@ -57,7 +57,6 @@ One line per term; each links to the page that owns it.
 - **Vault registry, stack factory, role granter:** the per-BoringVault publication of its Teller,
   Queue and Accountant that every `VedaEngine` of that vault is built on, the operator-gated factory
   that builds whole stacks on it, and the contract that gives what the factory builds its Veda roles
-  and, where the Teller admits by account, its place on the Teller's list
   ([Veda shared-vault stacks](modules/veda-shared-stacks.md)).
 
 ## Deployment tooling

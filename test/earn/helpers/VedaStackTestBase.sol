@@ -28,7 +28,6 @@ import {
     IRolesAuthority
 } from "../../../src/interfaces/external/veda/IRolesAuthority.sol";
 import { ITeller } from "../../../src/interfaces/external/veda/ITeller.sol";
-import { ITellerAllowlist } from "../../../src/interfaces/external/veda/ITellerAllowlist.sol";
 import { VedaRedeemRequest } from "../../../src/interfaces/external/veda/VedaTypes.sol";
 import { earnVaultTestNoFees } from "./EarnVaultMocks.sol";
 import { EarnVaultTestDeployer } from "./EarnVaultTestDeployer.sol";
@@ -306,9 +305,7 @@ abstract contract VedaStackTestBase is Test {
         rolesAuthority.setRoleCapability(
             OWNER_ROLE, address(listed), AllowlistTeller.setAllowlistEnabled.selector, true
         );
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(listed), ITellerAllowlist.setAllowedAccounts.selector, true
-        );
+        rolesAuthority.setRoleCapability(OWNER_ROLE, address(listed), AllowlistTeller.setAllowedAccounts.selector, true);
         listed.setAllowlistEnabled(true, true);
         if (address(queue_) != address(0)) {
             _list(listed, address(solver_));
