@@ -48,7 +48,7 @@ import { StackMockShareToken, StackMockTip20Factory, StackMockTip403Registry } f
 ///      RolesAuthority owned by a timelock, and every gated function asking its own authority. On top
 ///      of it, the canonical Earn core, a {VedaRoleGranter} as the RolesAuthority's authority, and a
 ///      {VedaStackFactory}. The two concrete bases below differ only in the kind of Teller the vault
-///      runs: one that gates its callers, or one that admits by account.
+///      runs: one that gates its callers, or one that also admits by account.
 abstract contract VedaStackTestBase is Test {
     uint64 internal constant MAX_RATE_AGE = 1 days;
 
@@ -65,9 +65,6 @@ abstract contract VedaStackTestBase is Test {
     // The two roles the vault sets aside for Earn, used for nothing else.
     uint8 internal constant EARN_ENGINE_ROLE = 40;
     uint8 internal constant EARN_FORWARDER_ROLE = 41;
-    /// @dev Held by the granter alone, on a vault whose Teller admits by account: `setAllowedAccounts`
-    /// on the Teller and nothing else.
-    uint8 internal constant LISTER_ROLE = 42;
 
     /// @dev The timelock: owns the RolesAuthority and holds the owner role.
     address internal admin = makeAddr("timelock");
@@ -136,16 +133,11 @@ abstract contract VedaStackTestBase is Test {
         rolesAuthority.setAuthority(address(granter));
         granter.setFactory(address(factory), true);
         _grantPauserCapabilities();
-        _adminSetupForTeller();
         // The batch's last call names the registry it published on and the factory it named, and undoes
-        // the whole setup unless the granter serves both, could grant both roles, and agrees with the
-        // published Teller about its list.
+        // the whole setup unless the granter serves both and could grant both roles.
         granter.assertSetup(IVedaVaultRegistry(address(registry)), address(factory));
         vm.stopPrank();
     }
-
-    /// @dev Called as the administrator inside the setup batch: what this variant's Teller needs.
-    function _adminSetupForTeller() internal virtual { }
 
     /// @dev Called as the administrator before it publishes new modules: whatever lets the vault's Earn
     /// stacks use them. A zero Queue comes with a zero solver.
@@ -307,9 +299,8 @@ abstract contract VedaStackTestBase is Test {
     // A Teller that admits by account
     // ------------------------------------------------------------------
 
-    /// @dev Called as the administrator: opens a Teller's bulk paths to every caller, turns its list on
-    /// in both directions, lists the stock solver, which redeems every settled request, and binds the
-    /// Queue to that list. A zero Queue comes with a zero solver.
+    /// @dev Called as the administrator: enables a Teller's account list in both directions, lists
+    /// the stock solver, and binds the Queue to that list. Bulk calls remain role-gated.
     function _configureAllowlist(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_) internal {
         AllowlistTeller listed = AllowlistTeller(address(teller_));
         rolesAuthority.setRoleCapability(
@@ -318,8 +309,6 @@ abstract contract VedaStackTestBase is Test {
         rolesAuthority.setRoleCapability(
             OWNER_ROLE, address(listed), ITellerAllowlist.setAllowedAccounts.selector, true
         );
-        rolesAuthority.setPublicCapability(address(listed), ITeller.bulkDeposit.selector, true);
-        rolesAuthority.setPublicCapability(address(listed), ITeller.bulkWithdraw.selector, true);
         listed.setAllowlistEnabled(true, true);
         if (address(queue_) != address(0)) {
             _list(listed, address(solver_));
@@ -333,21 +322,6 @@ abstract contract VedaStackTestBase is Test {
         address[] memory accounts = new address[](1);
         accounts[0] = account;
         teller_.setAllowedAccounts(accounts, true);
-    }
-
-    /// @dev Called as the administrator: the one function the granter's lister role reaches on a Teller.
-    function _grantListerCapability(AuthedTeller teller_) internal {
-        rolesAuthority.setRoleCapability(
-            LISTER_ROLE, address(teller_), ITellerAllowlist.setAllowedAccounts.selector, true
-        );
-    }
-
-    /// @dev Anyone carries the vault's engines onto the Teller published now.
-    function _relist(address engine) internal returns (uint256 carried) {
-        address[] memory engines = new address[](1);
-        engines[0] = engine;
-        vm.prank(stranger);
-        return granter.relist(engines);
     }
 
     // ------------------------------------------------------------------
@@ -462,14 +436,11 @@ abstract contract VedaStackTestBase is Test {
     }
 }
 
-/// @dev A vault whose Teller, Queue and stock solver gate their callers: the engine role's capabilities
-///      are what admit an engine, and the granter's allowlist flag stays clear.
+/// @dev A vault whose Teller, Queue and stock solver gate their callers.
 abstract contract VedaRoleStackTestBase is VedaStackTestBase { }
 
-/// @dev A vault whose Teller is open to every caller and admits by account instead: both bulk paths
-///      are public, the Teller enforces its allowlist in both directions, and its Queue applies the same
-///      list to request owners. The granter's allowlist flag is set, so it puts each engine on the list
-///      as the factory builds it. The Queue and the stock solver still gate callers through the roles.
+/// @dev A vault whose Teller also admits by account. The granter only grants roles; a separate
+///      administrator must list engines before deposits or exits can work.
 abstract contract VedaAllowlistStackTestBase is VedaStackTestBase {
     function _newTeller() internal virtual override returns (AuthedTeller) {
         return new AllowlistTeller(address(0), address(rolesAuthority), vault, address(accountant));
@@ -483,17 +454,10 @@ abstract contract VedaAllowlistStackTestBase is VedaStackTestBase {
         _configureAllowlist(teller, queue, solver);
     }
 
-    function _adminSetupForTeller() internal virtual override {
-        _grantListerCapability(teller);
-        rolesAuthority.setUserRole(address(granter), LISTER_ROLE, true);
-        granter.setTellerAllowlist(true);
-    }
-
     function _admitModules(AuthedTeller teller_, AuthedQueue queue_, AuthedSolver solver_) internal virtual override {
         super._admitModules(teller_, queue_, solver_);
         if (!AllowlistTeller(address(teller_)).depositAllowlistEnabled()) {
             _configureAllowlist(teller_, queue_, solver_);
         }
-        _grantListerCapability(teller_);
     }
 }

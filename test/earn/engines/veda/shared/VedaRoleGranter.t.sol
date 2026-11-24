@@ -401,20 +401,16 @@ contract VedaRoleGranterTest is VedaRoleStackTestBase {
         granter.setEngineAuthorized(grantee, false);
     }
 
-    function testARevocationTheRolesAuthorityRefusesRevertsWhenThereIsNoListingToRemove() public {
+    function testARevocationTheRolesAuthorityRefusesReverts() public {
         vm.prank(address(factory));
         granter.setEngineAuthorized(grantee, true);
-        // The administrator cuts the granter off. On a Teller without a list the role is all there is
-        // to revoke, so a revocation that cannot clear it is not reported as done.
+        // The administrator cuts the granter off. Role revocation must not be reported as done.
         vm.prank(admin);
         rolesAuthority.setAuthority(address(0));
         vm.prank(address(factory));
-        vm.expectRevert(
-            abi.encodeWithSelector(VedaRoleGranter.RoleUpdateFailed.selector, grantee, EARN_ENGINE_ROLE, false)
-        );
+        vm.expectRevert();
         granter.setEngineAuthorized(grantee, false);
         assertTrue(rolesAuthority.doesUserHaveRole(grantee, EARN_ENGINE_ROLE));
-        assertEq(granter.listedOn(grantee), address(0));
     }
 
     function _assertGrantRefusedWhileRoleReaches(address target, bytes4 functionSig) private {

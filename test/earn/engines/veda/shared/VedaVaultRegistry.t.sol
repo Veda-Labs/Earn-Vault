@@ -42,6 +42,15 @@ contract MockStockSolver {
     function boringRedeemSolve(bytes calldata, address, bool) external pure { }
 }
 
+/// @dev A Queue that exposes an optional Teller pointer, independent of account admission.
+contract MockQueueWithTeller is MockQueue {
+    address public immutable teller;
+
+    constructor(MockBoringVault vault_, MockAccountant accountant_, address teller_) MockQueue(vault_, accountant_) {
+        teller = teller_;
+    }
+}
+
 /// @dev Asks a registry which engine it names, as an engine does before it binds.
 contract EngineAsker {
     function ask(VedaVaultRegistry registry) external view returns (address) {
@@ -199,6 +208,22 @@ contract VedaVaultRegistryTest is Test {
         newQueue.setTrackWithdrawsOnChain(false);
         vm.expectRevert(abi.encodeWithSelector(VedaVaultRegistry.QueueTrackingDisabled.selector, address(newQueue)));
         _publish(newTeller, newQueue, newAccountant);
+    }
+
+    function testQueueTellerPointerMustMatchWhenExposed() public {
+        MockQueueWithTeller wrong = new MockQueueWithTeller(vault, accountant, stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                VedaVaultRegistry.QueueTellerMismatch.selector, address(wrong), address(teller), stranger
+            )
+        );
+        _publishRaw(address(teller), address(wrong), address(accountant), stockSolver);
+
+        MockQueueWithTeller unset = new MockQueueWithTeller(vault, accountant, address(0));
+        _publishRaw(address(teller), address(unset), address(accountant), stockSolver);
+        MockQueueWithTeller matching = new MockQueueWithTeller(vault, accountant, address(teller));
+        _publishRaw(address(teller), address(matching), address(accountant), stockSolver);
+        assertEq(registry.version(), 3);
     }
 
     function testATellerThatCannotMintAndBurnTheVaultsSharesIsRefused() public {

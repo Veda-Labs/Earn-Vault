@@ -23,7 +23,6 @@ import { EarnVault } from "../../../core/EarnVault.sol";
 import { VedaEngine } from "../VedaEngine.sol";
 import { VedaForwardingSolver } from "../VedaForwardingSolver.sol";
 import { VedaEngineDeployer, VedaForwardingSolverDeployer } from "./VedaStackDeployers.sol";
-import { VedaTellerAllowlist } from "./VedaTellerAllowlist.sol";
 
 /// @title VedaStackFactory
 /// @notice Builds complete Earn stacks on one BoringVault without a transaction from the vault's
@@ -77,9 +76,9 @@ import { VedaTellerAllowlist } from "./VedaTellerAllowlist.sol";
 ///      `StackCreated` say which stacks this factory built.
 ///
 ///      THE RECORDS ARE NOT THE PERMISSIONS. A status here says what this factory last did. The vault's
-///      administrator can change a permission or the Teller's list directly, and a function the vault
-///      lets anyone call stays callable by a revoked engine unless the Teller's list is what admits
-///      it. {isEngineReady} reads the engine's own modules live.
+///      administrator can change permissions directly. A function the vault lets anyone call stays
+///      callable by a revoked engine. {isEngineReady} reads role permissions on the engine's modules;
+///      a separate account-admission policy, if any, must be checked by the deployment service.
 /// The factory's wiring never changes.
 /// @custom:invariant address(registry) != address(0) && address(authorizer) != address(0)
 /// @custom:invariant address(earnFactory) != address(0) && forwarderOwner != address(0)
@@ -214,7 +213,6 @@ contract VedaStackFactory {
     error InvalidTransferPolicyAdmin(address admin);
     error JobAlreadyBuilt(bytes32 jobId, address engine);
     error NotAuthorizedOnVeda(address account, address target, bytes4 functionSig);
-    error NotListedOnTeller(address engine, address teller);
     error NotOperator(address caller);
     error NotPauser(address caller);
     error NotVaultAdmin(address caller);
@@ -366,17 +364,11 @@ contract VedaStackFactory {
     // Pausers: reduce
     // ------------------------------------------------------------------
 
-    /// @notice Takes an engine's role and, where it has one, its place on the Teller's list away: its
-    ///         deposits and immediate exits stop until the vault's administrator reinstates it, and so
-    ///         do its new queued requests and cancellations unless the vault lets anyone call those.
-    ///         Requests already queued can still be settled, except on a Queue that applies the
-    ///         Teller's list, which settles nothing for a delisted engine and lets a waiting request
-    ///         pass its deadline. For incidents only: the stack's users cannot exit instantly while it
-    ///         lasts.
-    /// @dev The granter removes the role and each listing independently and reports any it could not
-    ///      remove; it reverts only when it removed nothing. Where the vault lets anyone call the
-    ///      Teller, an engine stays usable until its listing is actually gone, and on a Teller without
-    ///      a list it keeps working.
+    /// @notice Takes an engine's role away. On role-gated modules, this stops new deposits, immediate
+    ///         exits, queued requests and cancellations until the vault's administrator reinstates it.
+    ///         Existing queued requests can still settle if the settlement path remains authorized.
+    /// @dev Reverts if the RolesAuthority refuses the role change. A public module function remains
+    ///      callable, and a separate Teller admission policy, if any, is not changed here.
     function revokeEngine(address engine) external onlyPauser nonReentrant {
         StackRecord storage record = _stacks[engine];
         if (record.status != EngineStatus.Active) revert EngineNotActive(engine);
@@ -415,9 +407,9 @@ contract VedaStackFactory {
     // ------------------------------------------------------------------
 
     /// @notice Gives a revoked engine its authorization back.
-    /// @dev The granter lists an engine on the published Teller. An engine that has not activated that
-    ///      Teller is still refused by the one it uses, and this reverts until its owner activates the
-    ///      publication or the administrator lists it there directly.
+    /// @dev The granter restores the Engine role. The authority checks use the Teller and Queue that
+    ///      this Engine currently uses, which can lag the registry's published tuple. A separate
+    ///      account-admission policy, if any, must be handled independently.
     function reinstateEngine(address engine) external onlyVaultAdmin nonReentrant {
         StackRecord storage record = _stacks[engine];
         if (record.status != EngineStatus.Revoked) revert EngineNotRevoked(engine);
@@ -477,46 +469,38 @@ contract VedaStackFactory {
         return authorizer.isFactory(address(this));
     }
 
-    /// @notice Whether `engine` is an active stack of this factory that the modules it uses would serve
-    ///         right now: allowed to call them, and admitted by its Teller's list.
+    /// @notice Whether `engine` is an active stack with authority to call its Teller and Queue.
     /// @dev Read live, unlike a stack's status, which only says what this factory last did, and read
     ///      from the engine's own Teller and Queue, which are the registry's published ones only once
-    ///      its owner has activated them. A Teller whose list is not enforced, or cannot be read,
-    ///      admits every account. It does not cover a paused Teller, a deposit cap, the stack's own
-    ///      EarnVault controls, or whether the Queue applies the Teller's list.
+    ///      its owner has activated them. This checks authority only. It does not check a Teller's
+    ///      account admission, pause state, deposit cap, or the EarnVault's controls.
     function isEngineReady(address engine) external view returns (bool) {
         if (_stacks[engine].status != EngineStatus.Active) return false;
         (address target,) = _firstRefusedCall(engine);
-        return target == address(0) && _isListed(engine, address(VedaEngine(engine).teller()));
+        return target == address(0);
     }
 
-    /// @notice Whether the Teller `engine` uses would still take a deposit from it or pay it an
-    ///         immediate exit, whatever its status here: the Teller's authority allows the call and
-    ///         its list admits the engine. False for an address this factory did not deploy.
-    /// @dev The check to make after {revokeEngine}. The granter removes the role and each listing
-    ///      where it can and reports what it could not, and a revoked engine this still returns true
-    ///      for is one that still works. It does not cover the Queue, a paused Teller or a deposit
-    ///      cap.
+    /// @notice Whether the Engine has authority for either Teller bulk function, regardless of its
+    ///         factory status. False for an address this factory did not deploy.
+    /// @dev Checks the Teller's authority, not account admission or operational availability.
+    ///      Use it after {revokeEngine} to find any remaining authority to call the Teller.
     function canEngineUseTeller(address engine) external view returns (bool) {
         if (_stacks[engine].status == EngineStatus.None) return false;
         address teller = address(VedaEngine(engine).teller());
-        (bool checked, bool allowed) = VedaTellerAllowlist.tryIsDepositAllowed(teller, engine);
-        if (_canCall(engine, teller, ITeller.bulkDeposit.selector) && (!checked || allowed)) return true;
-        (checked, allowed) = VedaTellerAllowlist.tryIsWithdrawAllowed(teller, engine);
-        return _canCall(engine, teller, ITeller.bulkWithdraw.selector) && (!checked || allowed);
+        return _canCall(engine, teller, ITeller.bulkDeposit.selector)
+            || _canCall(engine, teller, ITeller.bulkWithdraw.selector);
     }
 
     /// @notice Whether the wiring and permissions a queued exit needs are in place for `forwarder` and
     ///         `solver`: it is an active forwarding solver of this factory, fixed to the Queue and
     ///         Teller its engine uses now and, once the engine is on the published tuple, to the
     ///         published stock solver, admitted by its engine, allowed on its stock solver, and has
-    ///         `solver` approved; and a Teller that keeps a list admits the stock solver, and the
-    ///         engine where the Queue applies that list.
+    ///         `solver` approved.
     /// @dev Read live. The queued path is a backup that may go unused for a long time, so this is how
     ///      to learn that it is miswired before it is needed. True does not mean a settlement would
     ///      succeed: it does not cover the stock solver's own permissions on the Queue and the Teller,
-    ///      a pause, liquidity or a deficit nobody funds, the base asset's transfer policy, or a
-    ///      request's maturity and deadline. False does not mean broken for a forwarder fixed to a
+    ///      a pause, account admission, liquidity, a deficit nobody funds, the base asset's transfer
+    ///      policy, or a request's maturity and deadline. False does not mean broken for a forwarder fixed to a
     ///      replaced Queue that still has open requests.
     function isForwarderReady(address forwarder, address solver) external view returns (bool) {
         ForwarderRecord memory record = _forwarders[forwarder];
@@ -533,13 +517,6 @@ contract VedaStackFactory {
         }
         if (!engine.authorizedForwarder(forwarder) || !built.isAuthorizedSolver(solver)) return false;
         if (!_canCall(forwarder, stockSolver, IBoringSolver.boringRedeemSolve.selector)) return false;
-        (bool checked, bool allowed) = VedaTellerAllowlist.tryIsWithdrawAllowed(teller, stockSolver);
-        if (checked && !allowed) return false;
-        (bool queueChecks, address queueTeller) = VedaTellerAllowlist.tryTeller(queue);
-        if (queueChecks && queueTeller != address(0)) {
-            (checked, allowed) = VedaTellerAllowlist.tryIsWithdrawAllowed(queueTeller, record.engine);
-            if (checked && !allowed) return false;
-        }
         return true;
     }
 
@@ -659,22 +636,19 @@ contract VedaStackFactory {
     }
 
     /// @dev Has the granter admit an engine, then proves it worked on the modules the engine uses: the
-    ///      engine must now be allowed on its Teller's bulk paths and, when it has a Queue, on its
-    ///      request and cancellation, and a Teller that checks accounts must have the engine on its
-    ///      list. A stack whose permissions are not in place is never reported as built.
+    ///      engine must now be allowed by its authority on the Teller's bulk paths and, when it has
+    ///      a Queue, on its request and cancellation functions. Account admission is separate.
     function _authorizeEngine(address engine) private {
         authorizer.setEngineAuthorized(engine, true);
 
         (address target, bytes4 functionSig) = _firstRefusedCall(engine);
         if (target != address(0)) revert NotAuthorizedOnVeda(engine, target, functionSig);
-        address teller = address(VedaEngine(engine).teller());
-        if (!_isListed(engine, teller)) revert NotListedOnTeller(engine, teller);
         emit EngineAuthorizationChanged(engine, true, msg.sender);
     }
 
     /// @dev The first of an engine's calls on its own Teller and Queue that the module's authority
-    ///      refuses, or zero when it allows them all. Where a function is open to everyone this proves
-    ///      nothing about the engine, which is why {_isListed} is checked beside it.
+    ///      refuses, or zero when it allows them all. A public function also appears allowed here;
+    ///      deployment policy must verify which functions rely on a role.
     function _firstRefusedCall(address engine) private view returns (address target, bytes4 functionSig) {
         address teller = address(VedaEngine(engine).teller());
         if (!_canCall(engine, teller, ITeller.bulkDeposit.selector)) return (teller, ITeller.bulkDeposit.selector);
@@ -688,14 +662,6 @@ contract VedaStackFactory {
                 return (queue, IBoringQueue.cancelOnChainWithdrawUsingRequestId.selector);
             }
         }
-    }
-
-    /// @dev Whether the Teller's account allowlist admits `engine` as a share recipient and as a share
-    ///      owner. A Teller without an allowlist admits every account.
-    function _isListed(address engine, address teller) private view returns (bool) {
-        (bool depositChecked, bool depositAllowed) = VedaTellerAllowlist.tryIsDepositAllowed(teller, engine);
-        (bool withdrawChecked, bool withdrawAllowed) = VedaTellerAllowlist.tryIsWithdrawAllowed(teller, engine);
-        return (!depositChecked || depositAllowed) && (!withdrawChecked || withdrawAllowed);
     }
 
     /// @dev Authorizes a forwarding solver this factory built and proves it may drive its stock solver.
