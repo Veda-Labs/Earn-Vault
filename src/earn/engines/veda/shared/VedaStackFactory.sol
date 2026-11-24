@@ -39,8 +39,8 @@ import { VedaEngineDeployer, VedaForwardingSolverDeployer } from "./VedaStackDep
 ///      WHAT THE VAULT'S ADMINISTRATOR TRUSTS, ONCE. The administrator names this factory on its
 ///      `authorizer`, a {VedaRoleGranter}, having reviewed this contract's code and wiring: the
 ///      granter checks only that a factory reports the right registry and itself. From then on this
-///      contract decides which addresses receive the engine and forwarder roles and, where the Teller
-///      admits by account, a place on its list, so it gives them only to contracts it built itself:
+///      contract decides which addresses receive the engine and forwarder roles. It gives those roles
+///      only to contracts it built itself:
 ///      - an engine comes from the pinned engine deployer in this contract's own call, is owned by this
 ///        contract until it is bound, and is bound to the EarnVault the pinned `EarnFactory` just
 ///        produced for it. A canonical engine lets its owner bind any EarnVault, so checking an
