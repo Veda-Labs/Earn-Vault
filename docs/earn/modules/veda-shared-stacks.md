@@ -78,7 +78,8 @@ address the call was made from and says nothing.
 
 `VedaStackFactory` is immutable to one registry, the vault's [role granter](#role-granter), the
 canonical `EarnFactory`, the two deployers, and the owner and treasury of every forwarding solver it
-builds. `EarnFactory` and both deployers are pinned by address and by the code hash named at
+builds. `EarnFactory`, both deployers and, when the forwarders' owner is a
+[steward](#forwarder-steward), that steward are pinned by address and by the code hash named at
 construction.
 
 `createStack(jobId, engineParams, core, newTransferPolicyAdmin)`, callable only by the operator:
@@ -113,6 +114,17 @@ The factory passes `core.controls.migrationMode` through to `EarnFactory`: selec
 That choice cannot change afterward. For a production vault, set `core.owner` to its governance
 timelock if migration must require an admin transaction.
 
+**The operator chooses `core.owner` unless the administrator fixes it.**
+`setRequiredStackOwner(owner)` makes `createStack` and `finalizeStack` refuse any other `core.owner`
+(`StackOwnerNotAllowed`); zero, the default, leaves the choice to the operator. The fees, controls,
+rate age bound and transfer policy stay the operator's choice either way. The rule applies when a
+stack is built and never afterwards:
+
+- changing or lifting it touches no stack already built;
+- a stack's owner can still [hand the stack on](#handing-a-stack-to-another-owner) later, and the
+  factory has no say in that; and
+- a migration candidate is not subject to it: it goes to its EarnVault's current operator.
+
 The factory builds nothing, not even a pending engine, until the administrator names it on the
 granter (`AuthorizerNotBound`). It
 authorizes only contracts it built itself. Checking an engine's code would not be enough, because a
@@ -141,12 +153,12 @@ solver adds a storage write to every forwarder built.
 core first and make it revert; finalize again under another `deploymentId`. Such a core is bound to
 nothing and holds nothing.
 
-| Caller             | Functions                                                                                                                     |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
-| Operator           | `createStack`, `deployEngine`, `deployMigrationEngine`, `finalizeStack`, `deployForwarder`                                    |
-| EarnVault operator | `finalizeMigrationEngine` for an Engine committed to that EarnVault                                                           |
-| Pausers            | `revokeEngine`, `revokeForwarder`, `pauseRegistrations`, `discardEngine`                                                      |
-| Administrator      | The pausers' functions, `reinstateEngine`, `reinstateForwarder`, `resumeRegistrations`, `setClosedToNewStacks`, `setOperator` |
+| Caller             | Functions                                                                                                                                              |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Operator           | `createStack`, `deployEngine`, `deployMigrationEngine`, `finalizeStack`, `deployForwarder`                                                             |
+| EarnVault operator | `finalizeMigrationEngine` for an Engine committed to that EarnVault                                                                                    |
+| Pausers            | `revokeEngine`, `revokeForwarder`, `pauseRegistrations`, `discardEngine`                                                                               |
+| Administrator      | The pausers' functions, `reinstateEngine`, `reinstateForwarder`, `resumeRegistrations`, `setClosedToNewStacks`, `setRequiredStackOwner`, `setOperator` |
 
 Pausers are the accounts the BoringVault's authority allows to call that function on the factory;
 the administrator grants those capabilities to the vault's pause roles. Pausing and revoking only
@@ -166,7 +178,9 @@ The records say what the factory last did, not what the module authorities permi
 Teller and Queue. `canEngineUseTeller(engine)` checks whether either bulk call remains authorized,
 regardless of the factory record. `isForwarderReady(forwarder, solver)` checks the queued path's
 wiring, the Engine's forwarder authorization, the forwarder's approved solver and its authority to
-call the stock solver. These views do not check Teller account admission, pauses, caps, liquidity,
+call the stock solver, and the stock solver's own part of a settlement: its authority to call
+`solveOnChainWithdraws` on the Queue and `bulkWithdraw` on the Teller, and the Queue's authority to
+call `boringSolve` back on it. These views do not check Teller account admission, pauses, caps, liquidity,
 transfer policy, Queue maturity or a request deadline. A public module capability also reads as
 authorized; the deployment policy must check whether a role is actually required.
 `stack(engine).forwarder` is the forwarding solver built with the stack, and a later
@@ -234,7 +248,11 @@ A `VedaForwardingSolver` lets only its owner approve the solvers that may trigge
 ownership moves in two steps, so a factory cannot approve one and hand the forwarder on in the same
 call. Without a steward a new forwarding solver settles nothing until its owner sends a transaction.
 
-`VedaForwarderSteward` is the forwarders' owner from construction. Its own owner, typically a Safe,
+`VedaForwarderSteward` is the forwarders' owner from construction. A factory built with
+`forwarderOwnerIsSteward` requires the steward's code hash to be the one its deployer names
+(`forwarderStewardCodeHash`), which a reviewer compares with the release: a contract that only
+answered `seed` would leave every forwarder with no approved solver and an owner that could never
+approve one. Its own owner, typically a Safe,
 keeps one list of solvers (`setSolver`, at most eight). Applying the list to a forwarder is open to
 anyone, because it only moves that forwarder toward the list:
 
@@ -265,7 +283,9 @@ replacing it. In one vault administrator batch:
    call.
 4. Set the RolesAuthority's external authority to the granter and name the factory.
 5. Give the vault's pause roles the factory's revoke, pause and discard functions.
-6. Call `granter.assertSetup(registry, factory)` to check the role-grant wiring and protected
+6. If every stack on the vault is to have one owner, call `factory.setRequiredStackOwner(owner)`.
+   Without it the operator key chooses each stack's owner.
+7. Call `granter.assertSetup(registry, factory)` to check the role-grant wiring and protected
    capabilities before the batch completes.
 
 For a role-only Teller, confirm both bulk functions are not public in the deployment preflight. A
@@ -315,15 +335,25 @@ deploying another EarnVault, EarnShare or EarnFees:
    role, and builds and authorizes a Queue forwarder when needed. This call moves no funds.
 3. The same EarnVault operator later calls
    [`migrateEngine(newEngine, minNewEngineShares, minAssetsRetained)`](../architecture/system.md#whole-pool-engine-migration)
-   with reviewed floors. Finalization and migration may be in one timelock execution batch.
+   with reviewed floors.
+
+**Finalize and migrate in one batch, or check the owner in the migration batch.** A candidate goes
+to the operator who finalizes it, an EarnVault's operator can change afterwards, and `migrateEngine`
+does not look at the Engine's owner. A new operator who migrated into a candidate the former operator
+finalized would leave the pool in an Engine the former operator still administers: its forwarder
+list, periphery activation, rate age bound, settlement recovery and dust sweep, never the BoringVault
+shares that back the pool. One execution batch that calls `finalizeMigrationEngine` and then
+`migrateEngine` has no such gap. When they are separate transactions, the migration batch calls
+`factory.assertMigrationCurrent(engine)` immediately before `migrateEngine`; it reverts
+(`MigrationOwnerStale`) unless the candidate is still authorized and its owner is the EarnVault's
+current operator. For a stale candidate, a pauser revokes it and the new operator prepares another.
 
 The destination vault must have named its factory on the role granter during one-time setup. No
 per-migration destination vault admin role grant is needed after that. A prepared candidate's
 `stack(engine).status` is `Active` because it has roles, even while `EarnVault.engine()` still names
-the source Engine. Its `earnShare` and `earnFees` record fields remain zero. If preparation and
-migration are separate, recheck that the candidate's owner is still the EarnVault's current
-operator before execution. If the Queue is used, verify the forwarder's approved worker and live
-solver path; a role grant alone does not make the worker ready.
+the source Engine. Its `earnShare` and `earnFees` record fields remain zero. If the Queue is used,
+verify the forwarder's approved worker and live solver path; a role grant alone does not make the
+worker ready.
 
 `migrateEngine` needs zero open Earn async requests, a full immediate source-Teller redemption,
 and a successful destination deposit. The factory does not supply liquidity or migrate assets.
@@ -337,6 +367,16 @@ deployments. A strict provenance policy would need approved source factories or 
 registry. Funded contract tests exercise both same-vault and distinct-vault migration with mocks.
 Production use still needs a funded two-vault fork rehearsal with the real source buffer,
 destination cap, rates, roles, and migration floors.
+
+### Handing a stack to another owner
+
+A stack has two seats, and the released contracts move them separately: the EarnVault's operator
+(`transferOperator`, then `acceptOperator`) and the Engine's owner (`transferOwnership`, then
+`acceptOwnership`). Move both in the same batches. A stack whose EarnVault has a new operator and
+whose Engine still has the old owner leaves the old owner administering the Engine. Neither call
+involves the factory, so `requiredStackOwner` neither blocks a transfer nor follows one, and the
+stack's record, role and factory-built forwarders are unchanged. Its forwarders stay owned by the
+factory's forwarder owner.
 
 ### Replacing the factory
 

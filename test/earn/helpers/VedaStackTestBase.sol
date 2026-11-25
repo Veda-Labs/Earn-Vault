@@ -278,6 +278,7 @@ abstract contract VedaStackTestBase is Test {
             forwarderDeployerCodeHash: address(forwarderDeployer).codehash,
             forwarderOwner: forwarderOwner,
             forwarderOwnerIsSteward: forwarderOwnerIsSteward,
+            forwarderStewardCodeHash: forwarderOwnerIsSteward ? forwarderOwner.codehash : bytes32(0),
             forwarderTreasury: treasury,
             operator: operator
         });

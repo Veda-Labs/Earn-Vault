@@ -147,6 +147,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
     );
     event TransferPolicyCreated(uint64 indexed policyId, address indexed admin);
     event ClosedToNewStacksChanged(bool closed, address indexed by);
+    event RequiredStackOwnerChanged(address indexed oldOwner, address indexed newOwner, address indexed by);
 
     // ------------------------------------------------------------------
     // Building a stack
@@ -1435,6 +1436,138 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         assertEq(oldEngine.totalShares(), 0);
         assertEq(VedaEngine(replacement).totalShares(), 100e6);
         assertEq(_deposit(earnVault, user, 1e6), 1e6);
+    }
+
+    function testTheAdministratorFixesTheOwnerOfEveryNewStack() public {
+        address otherOwner = makeAddr("other owner");
+        address[3] memory nonAdmins = [operator, pauser, stranger];
+        for (uint256 i = 0; i < nonAdmins.length; i++) {
+            vm.prank(nonAdmins[i]);
+            vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.NotVaultAdmin.selector, nonAdmins[i]));
+            factory.setRequiredStackOwner(nonAdmins[i]);
+        }
+        vm.prank(admin);
+        vm.expectRevert(VedaStackFactory.FactoryCannotBeOwner.selector);
+        factory.setRequiredStackOwner(address(factory));
+        assertEq(factory.requiredStackOwner(), address(0));
+
+        vm.expectEmit(address(factory));
+        emit RequiredStackOwnerChanged(address(0), stackOwner, admin);
+        vm.prank(admin);
+        factory.setRequiredStackOwner(stackOwner);
+
+        // The operator can no longer build a stack for an owner of its choosing, in one call or two.
+        EarnFactory.DeployParams memory wrong = _coreParams(STACK_A);
+        wrong.owner = otherOwner;
+        vm.startPrank(operator);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.StackOwnerNotAllowed.selector, otherOwner, stackOwner));
+        factory.createStack(_nextJob(), _engineParams(), wrong, address(0));
+        address pendingEngine = factory.deployEngine(_nextJob(), _engineParams());
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.StackOwnerNotAllowed.selector, otherOwner, stackOwner));
+        factory.finalizeStack(pendingEngine, wrong, address(0));
+        assertEq(uint256(factory.stack(pendingEngine).status), uint256(VedaStackFactory.EngineStatus.Pending));
+        assertFalse(_canCall(pendingEngine, address(teller), ITeller.bulkDeposit.selector));
+        EarnFactory.DeployParams memory right = _coreParams(STACK_A);
+        right.controls.migrationMode = EngineMigrationMode.OperatorEnabled;
+        (address earnVault_,) = factory.finalizeStack(pendingEngine, right, address(0));
+        vm.stopPrank();
+        EarnVault earnVault = EarnVault(earnVault_);
+        VedaEngine engine = VedaEngine(pendingEngine);
+        assertEq(earnVault.operator(), stackOwner);
+        assertEq(engine.owner(), stackOwner);
+        _deposit(earnVault, user, 100e6);
+
+        // The pin is a rule for building. The owner can still hand a stack on, both seats, and the
+        // factory has no say in it.
+        vm.startPrank(stackOwner);
+        earnVault.transferOperator(otherOwner);
+        engine.transferOwnership(otherOwner);
+        vm.stopPrank();
+        vm.startPrank(otherOwner);
+        earnVault.acceptOperator();
+        engine.acceptOwnership();
+        vm.stopPrank();
+        assertEq(earnVault.operator(), otherOwner);
+        assertEq(engine.owner(), otherOwner);
+        assertEq(factory.requiredStackOwner(), stackOwner);
+        assertTrue(factory.isEngineReady(address(engine)));
+        assertEq(_deposit(earnVault, user, 1e6), 1e6);
+
+        // A migration candidate goes to its EarnVault's current operator, whatever the pin says.
+        vm.prank(operator);
+        address replacement = factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+        vm.prank(otherOwner);
+        factory.finalizeMigrationEngine(replacement);
+        assertEq(VedaEngine(replacement).owner(), otherOwner);
+        factory.assertMigrationCurrent(replacement);
+
+        // Changing the pin touches no stack already built; lifting it returns the choice to the operator.
+        vm.expectEmit(address(factory));
+        emit RequiredStackOwnerChanged(stackOwner, address(0), admin);
+        vm.prank(admin);
+        factory.setRequiredStackOwner(address(0));
+        assertEq(engine.owner(), otherOwner);
+        EarnFactory.DeployParams memory free = _coreParams(STACK_B);
+        free.owner = otherOwner;
+        vm.prank(operator);
+        (address freeEngine,,) = factory.createStack(_nextJob(), _engineParams(), free, address(0));
+        assertEq(VedaEngine(freeEngine).owner(), otherOwner);
+    }
+
+    function testAMigrationPreparedForAFormerOperatorIsCaughtBeforeThePoolMoves() public {
+        address newOperator = makeAddr("new earn vault operator");
+        (VedaEngine oldEngine, EarnVault earnVault,) = _migratableStack(STACK_A);
+        _deposit(earnVault, user, 100e6);
+
+        // Neither an ordinary engine nor a candidate that is still pending is a prepared migration.
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.MigrationTargetMissing.selector, address(oldEngine)));
+        factory.assertMigrationCurrent(address(oldEngine));
+        vm.prank(operator);
+        address stale = factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotActive.selector, stale));
+        factory.assertMigrationCurrent(stale);
+
+        vm.prank(stackOwner);
+        factory.finalizeMigrationEngine(stale);
+        factory.assertMigrationCurrent(stale);
+
+        // The EarnVault changes hands before the pool moves. The candidate stays with the operator
+        // who finalized it.
+        vm.prank(stackOwner);
+        earnVault.transferOperator(newOperator);
+        vm.prank(newOperator);
+        earnVault.acceptOperator();
+        vm.expectRevert(
+            abi.encodeWithSelector(VedaStackFactory.MigrationOwnerStale.selector, stale, stackOwner, newOperator)
+        );
+        factory.assertMigrationCurrent(stale);
+
+        // Without the check nothing stops the new operator: the pool would sit in an engine the former
+        // operator still administers.
+        uint256 beforeMigration = vm.snapshotState();
+        vm.prank(newOperator);
+        earnVault.migrateEngine(stale, 100e6, 100e6);
+        assertEq(earnVault.engine(), stale);
+        assertEq(VedaEngine(stale).owner(), stackOwner);
+        vm.revertToState(beforeMigration);
+        assertEq(earnVault.engine(), address(oldEngine));
+
+        // The way out: a pauser revokes the stale candidate and the new operator prepares its own.
+        vm.prank(pauser);
+        factory.revokeEngine(stale);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotActive.selector, stale));
+        factory.assertMigrationCurrent(stale);
+        vm.prank(operator);
+        address replacement = factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+        vm.startPrank(newOperator);
+        factory.finalizeMigrationEngine(replacement);
+        factory.assertMigrationCurrent(replacement);
+        earnVault.migrateEngine(replacement, 100e6, 100e6);
+        vm.stopPrank();
+        assertEq(earnVault.engine(), replacement);
+        assertEq(VedaEngine(replacement).owner(), newOperator);
+        assertEq(VedaEngine(replacement).totalShares(), 100e6);
+        factory.assertMigrationCurrent(replacement);
     }
 
     function testOnlyTheAdministratorClosesAndOpensAFactory() public {
