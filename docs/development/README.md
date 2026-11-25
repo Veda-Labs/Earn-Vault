@@ -108,7 +108,7 @@ hash, which the reviewed factory releases pin: changing any of them, including b
 
 [`.gas-snapshot`](../../.gas-snapshot) records only the `test/earn/gas/` benchmarks: fee checkpointing on
 deposit, redeem, and contribution, the Veda engine and full-stack paths, including
-queued-request forwarding, and the SingleZoneEarnRouter deposit and redeem callbacks. `pnpm gas:snapshot` checks it. After a material contract change, run
+queued-request forwarding, stack building through `VedaStackFactory`, and the SingleZoneEarnRouter deposit and redeem callbacks. `pnpm gas:snapshot` checks it. After a material contract change, run
 `forge build --force` and `pnpm gas:update` with the [toolchain](#toolchain) Foundry and solar versions. Values
 are whole test-case gas before EIP-3529 refunds: compare the same row across revisions, not against
 production receipts.
