@@ -137,15 +137,21 @@ solver adds a storage write to every forwarder built.
 core first and make it revert; finalize again under another `deploymentId`. Such a core is bound to
 nothing and holds nothing.
 
-| Caller        | Functions                                                                                             |
-| ------------- | ----------------------------------------------------------------------------------------------------- |
-| Operator      | `createStack`, `deployEngine`, `finalizeStack`, `deployForwarder`                                     |
-| Pausers       | `revokeEngine`, `revokeForwarder`, `pauseRegistrations`, `discardEngine`                              |
-| Administrator | The pausers' functions, `reinstateEngine`, `reinstateForwarder`, `resumeRegistrations`, `setOperator` |
+| Caller        | Functions                                                                                                                     |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Operator      | `createStack`, `deployEngine`, `finalizeStack`, `deployForwarder`                                                             |
+| Pausers       | `revokeEngine`, `revokeForwarder`, `pauseRegistrations`, `discardEngine`                                                      |
+| Administrator | The pausers' functions, `reinstateEngine`, `reinstateForwarder`, `resumeRegistrations`, `setClosedToNewStacks`, `setOperator` |
 
 Pausers are the accounts the BoringVault's authority allows to call that function on the factory;
 the administrator grants those capabilities to the vault's pause roles. Pausing and revoking only
 reduce what the factory and its stacks can do. A paused factory refuses every operator call.
+
+Pausing is for incidents. A factory that should only stop taking new stacks is closed by the
+administrator with `setClosedToNewStacks(true)`: it then deploys no engine and finalizes no stack, an
+engine left pending included (`FactoryClosedToNewStacks`), and `deployForwarder` still works, so its
+existing stacks can follow a change of Queue, stock solver or Teller. Closing changes nothing else,
+and a closed factory can still be paused.
 
 The records say what the factory last did, not what the module authorities permit now.
 `isEngineReady(engine)` checks the active factory record and the Engine's authority on its current
@@ -299,8 +305,10 @@ A Teller with separate account admission also needs that admission before the st
 ### Replacing the factory
 
 A new release uses a new factory against the same registry and granter. The administrator names it
-beside the old one. Keep the old factory named while its stacks need factory-mediated revocation,
-reinstatement or new forwarding solvers, but pause its registrations. Once the administrator stops
+beside the old one and, in the same batch, closes the old one to new stacks
+(`setClosedToNewStacks(true)`). Keep the old factory named while its stacks need factory-mediated
+revocation, reinstatement or new forwarding solvers. Do not leave it paused: only the factory that
+built a stack can build its forwarders, and a paused factory builds none. Once the administrator stops
 naming a factory, its existing roles remain and only the RolesAuthority owner can revoke them
 directly. The factory's own records do not change.
 

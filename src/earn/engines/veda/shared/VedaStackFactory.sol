@@ -61,9 +61,11 @@ import { VedaEngineDeployer, VedaForwardingSolverDeployer } from "./VedaStackDep
 ///      an engine's owner admits them. It never reaches a role, the registry, another stack's settings
 ///      or vault custody. The vault's pausers, and its administrator, can
 ///      revoke an engine or a forwarder and pause new registrations; pausing is the first response to a
-///      leaked operator, since it stops every stack-building call at once. Only the administrator
+///      leaked operator, since it stops every operator call at once. Only the administrator
 ///      reinstates, resumes, or replaces the operator. Pausers are the accounts the BoringVault's
-///      authority allows to call the pausing function on this contract.
+///      authority allows to call the pausing function on this contract. The administrator can also
+///      close a factory to new stacks, which is how a replaced factory is retired: it then builds only
+///      the forwarding solvers its existing stacks need after a publication.
 ///
 ///      ONE CALL OR TWO. `createStack` does everything in one transaction. Where a chain's
 ///      per-transaction gas cap is below that, `deployEngine` then `finalizeStack` do the same in two;
@@ -166,6 +168,9 @@ contract VedaStackFactory {
     address public operator;
     /// @notice While set, no engine, stack or forwarding solver is built or authorized.
     bool public registrationsPaused;
+    /// @notice While set, no engine is deployed and no stack is finalized. Forwarding solvers are still
+    ///         built for the stacks this factory already has, so they can follow a publication.
+    bool public closedToNewStacks;
 
     /// @notice The engine built for each job id; zero when no build under that id has landed. A job id
     ///         builds one engine, so a build that is sent twice lands once.
@@ -191,6 +196,7 @@ contract VedaStackFactory {
     event EngineAuthorizationChanged(address indexed engine, bool authorized, address indexed by);
     event ForwarderAuthorizationChanged(address indexed forwarder, bool authorized, address indexed by);
     event RegistrationsPauseChanged(bool paused, address indexed by);
+    event ClosedToNewStacksChanged(bool closed, address indexed by);
     event OperatorChanged(address indexed oldOperator, address indexed newOperator);
     event TransferPolicyCreated(uint64 indexed policyId, address indexed admin);
 
@@ -204,6 +210,7 @@ contract VedaStackFactory {
     error EngineNotRevoked(address engine);
     error EnginePeripheryStale(address engine, uint64 engineVersion, uint64 publishedVersion);
     error FactoryCannotBeOwner();
+    error FactoryClosedToNewStacks();
     error ForwarderNotActive(address forwarder);
     error ForwarderNotSeeded(address forwarder);
     error ForwarderNotRevoked(address forwarder);
@@ -386,7 +393,9 @@ contract VedaStackFactory {
         emit ForwarderAuthorizationChanged(forwarder, false, msg.sender);
     }
 
-    /// @notice Stops every stack-building call until the vault's administrator resumes them.
+    /// @notice Stops every operator call, {deployForwarder} included, until the vault's administrator
+    ///         resumes them. For incidents; a factory that only stops taking new stacks is closed with
+    ///         {setClosedToNewStacks}.
     function pauseRegistrations() external onlyPauser {
         registrationsPaused = true;
         emit RegistrationsPauseChanged(true, msg.sender);
@@ -430,6 +439,16 @@ contract VedaStackFactory {
     function resumeRegistrations() external onlyVaultAdmin {
         registrationsPaused = false;
         emit RegistrationsPauseChanged(false, msg.sender);
+    }
+
+    /// @notice Closes this factory to new stacks, or opens it again: for a factory a newer one has
+    ///         replaced. While closed it deploys no engine and finalizes no stack, an engine left
+    ///         pending included, and still builds forwarding solvers for its existing stacks
+    ///         ({deployForwarder}), which need one after the vault changes its Queue, stock solver or
+    ///         Teller. Revoking, reinstating and pausing are unaffected.
+    function setClosedToNewStacks(bool closed) external onlyVaultAdmin {
+        closedToNewStacks = closed;
+        emit ClosedToNewStacksChanged(closed, msg.sender);
     }
 
     /// @notice Replaces the operator, for example after a key rotation.
@@ -525,6 +544,7 @@ contract VedaStackFactory {
     // ------------------------------------------------------------------
 
     function _deployEngine(bytes32 jobId, EngineParams calldata engineParams) private returns (address engine) {
+        _requireOpenToNewStacks();
         _requireAuthorizerBound();
         if (jobId == bytes32(0)) revert EmptyJobId();
         address built = engineOf[jobId];
@@ -556,6 +576,7 @@ contract VedaStackFactory {
         private
         returns (address earnVault, address earnShare)
     {
+        _requireOpenToNewStacks();
         StackRecord storage record = _stacks[engine];
         if (record.status != EngineStatus.Pending) revert EngineNotPending(engine);
         if (core.engine != address(0)) revert EngineMustBeUnset(core.engine);
@@ -684,6 +705,12 @@ contract VedaStackFactory {
 
     function _requireAuthorizerBound() private view {
         if (!isAuthorizerBound()) revert AuthorizerNotBound();
+    }
+
+    /// @dev Checked where an engine is deployed and where a stack is finalized, so that it holds for
+    ///      every entry point that reaches either.
+    function _requireOpenToNewStacks() private view {
+        if (closedToNewStacks) revert FactoryClosedToNewStacks();
     }
 
     function _requireCode(address account) private view {
