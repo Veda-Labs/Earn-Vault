@@ -7,6 +7,9 @@ pragma solidity ^0.8.36;
 // forge-lint: disable-start(multi-contract-file)
 import { EarnFactory } from "../../../../../src/earn/core/EarnFactory.sol";
 import { EarnVault } from "../../../../../src/earn/core/EarnVault.sol";
+import { EngineMigrationMode } from "../../../../../src/interfaces/earn/EarnVaultTypes.sol";
+import { IEarnVault } from "../../../../../src/interfaces/earn/IEarnVault.sol";
+import { IEarnEngine } from "../../../../../src/interfaces/earn/engines/IEarnEngine.sol";
 import { IForwardingEngine, VedaForwardingSolver } from "../../../../../src/earn/engines/veda/VedaForwardingSolver.sol";
 import { VedaEngine } from "../../../../../src/earn/engines/veda/VedaEngine.sol";
 import { VedaRoleGranter } from "../../../../../src/earn/engines/veda/shared/VedaRoleGranter.sol";
@@ -25,10 +28,18 @@ import { TIP403_REGISTRY_ADDRESS } from "../../../../../src/interfaces/external/
 import { IBoringQueue } from "../../../../../src/interfaces/external/veda/IBoringQueue.sol";
 import { IBoringSolver } from "../../../../../src/interfaces/external/veda/IBoringSolver.sol";
 import { IBoringVault } from "../../../../../src/interfaces/external/veda/IBoringVault.sol";
-import { IRolesAuthority } from "../../../../../src/interfaces/external/veda/IRolesAuthority.sol";
+import { IBoringVaultCustody, IRolesAuthority } from "../../../../../src/interfaces/external/veda/IRolesAuthority.sol";
+import { IAccountant } from "../../../../../src/interfaces/external/veda/IAccountant.sol";
 import { ITeller } from "../../../../../src/interfaces/external/veda/ITeller.sol";
 import { IVedaPeripheryRegistry } from "../../../../../src/interfaces/external/veda/IVedaPeripheryRegistry.sol";
-import { AuthedBoringVault, AuthedQueue, AuthedSolver, AuthedTeller } from "../../../helpers/VedaAuthMocks.sol";
+import {
+    AuthedBoringVault,
+    AuthedQueue,
+    AuthedSolver,
+    AuthedTeller,
+    MockRolesAuthority
+} from "../../../helpers/VedaAuthMocks.sol";
+import { MockAccountant, MockBoringVault } from "../../../helpers/VedaEngineMocks.sol";
 import { StackMockShareToken, StackMockTip403Registry } from "../../../helpers/VedaStackMocks.sol";
 import { VedaRoleStackTestBase, VedaStackTestBase } from "../../../helpers/VedaStackTestBase.sol";
 
@@ -267,6 +278,294 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         assertEq(VedaEngine(engine).earnVault(), earnVault);
         assertEq(factory.engineCount(), 1);
         assertEq(_deposit(EarnVault(earnVault), user, 10e6), 10e6);
+    }
+
+    function testSharedFactoryCanCreateAnOperatorMigratableStack() public {
+        EarnFactory.DeployParams memory params = _coreParams(STACK_A);
+        params.controls.migrationMode = EngineMigrationMode.UserOnly;
+        vm.prank(operator);
+        (, address userOnlyVault,) = factory.createStack(_nextJob(), _engineParams(), params, address(0));
+        assertEq(uint256(EarnVault(userOnlyVault).engineMigrationMode()), uint256(EngineMigrationMode.UserOnly));
+
+        params = _coreParams(STACK_B);
+        params.owner = admin;
+        params.controls.migrationMode = EngineMigrationMode.OperatorEnabled;
+        vm.prank(operator);
+        (address engine, address earnVault,) = factory.createStack(_nextJob(), _engineParams(), params, address(0));
+
+        assertEq(uint256(EarnVault(earnVault).engineMigrationMode()), uint256(EngineMigrationMode.OperatorEnabled));
+        assertEq(EarnVault(earnVault).operator(), admin);
+        assertEq(VedaEngine(engine).owner(), admin);
+    }
+
+    function testEarnVaultOperatorPreparesMigrationEngineAndMovesFundedPool() public {
+        (VedaEngine oldEngine, EarnVault earnVault, StackMockShareToken earnShare) = _migratableStack(STACK_A);
+        _deposit(earnVault, user, 100e6);
+        bytes32 jobId = _nextJob();
+        vm.prank(operator);
+        address replacement = factory.deployMigrationEngine(jobId, _engineParams(), address(earnVault));
+
+        assertEq(factory.migrationTargetOf(replacement), address(earnVault));
+        assertEq(factory.engineOf(jobId), replacement);
+        assertEq(uint256(factory.stack(replacement).status), uint256(VedaStackFactory.EngineStatus.Pending));
+        assertEq(VedaEngine(replacement).owner(), address(factory));
+        assertEq(VedaEngine(replacement).earnVault(), address(0));
+        assertFalse(_canCall(replacement, address(teller), ITeller.bulkDeposit.selector));
+
+        vm.prank(stackOwner);
+        address forwarder = factory.finalizeMigrationEngine(replacement);
+        VedaStackFactory.StackRecord memory record = factory.stack(replacement);
+        assertEq(uint256(record.status), uint256(VedaStackFactory.EngineStatus.Active));
+        assertEq(record.earnVault, address(earnVault));
+        assertEq(record.earnShare, address(0));
+        assertEq(record.earnFees, address(0));
+        assertEq(record.forwarder, forwarder);
+        assertEq(record.creator, operator);
+        assertEq(record.createdAtBlock, block.number);
+        assertEq(VedaEngine(replacement).earnVault(), address(earnVault));
+        assertEq(VedaEngine(replacement).owner(), stackOwner);
+        assertEq(earnVault.engine(), address(oldEngine));
+        assertTrue(factory.isEngineReady(replacement));
+        assertTrue(VedaEngine(replacement).authorizedForwarder(forwarder));
+        assertTrue(_canCall(forwarder, address(solver), IBoringSolver.boringRedeemSolve.selector));
+
+        vm.prank(stackOwner);
+        earnVault.migrateEngine(replacement, 100e6, 100e6);
+        assertEq(earnVault.engine(), replacement);
+        assertEq(oldEngine.totalShares(), 0);
+        assertEq(VedaEngine(replacement).totalShares(), 100e6);
+        assertEq(earnVault.totalAssets(), 100e6);
+        assertEq(earnShare.balanceOf(user), 100e6);
+    }
+
+    function testMigrationMovesFundedPoolBetweenDistinctBoringVaults() public {
+        (VedaEngine oldEngine, EarnVault earnVault, StackMockShareToken earnShare) = _migratableStack(STACK_A);
+        _deposit(earnVault, user, 100e6);
+        (VedaStackFactory destinationFactory, AuthedBoringVault destinationVault, AuthedTeller destinationTeller) =
+            _newImmediateDestination();
+        assertTrue(address(destinationVault) != address(vault));
+
+        vm.prank(operator);
+        address replacement = destinationFactory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+        assertEq(destinationFactory.migrationTargetOf(replacement), address(earnVault));
+        assertEq(address(VedaEngine(replacement).vault()), address(destinationVault));
+        assertFalse(_canCall(replacement, address(destinationTeller), ITeller.bulkDeposit.selector));
+
+        vm.prank(stackOwner);
+        address forwarder = destinationFactory.finalizeMigrationEngine(replacement);
+        assertEq(forwarder, address(0));
+        assertTrue(_canCall(replacement, address(destinationTeller), ITeller.bulkDeposit.selector));
+        assertEq(vault.balanceOf(address(oldEngine)), 100e6);
+        assertEq(destinationVault.balanceOf(replacement), 0);
+
+        vm.prank(stackOwner);
+        earnVault.migrateEngine(replacement, 100e6, 100e6);
+        assertEq(earnVault.engine(), replacement);
+        assertEq(vault.balanceOf(address(oldEngine)), 0);
+        assertEq(destinationVault.balanceOf(replacement), 100e6);
+        assertEq(asset.balanceOf(address(vault)), 0);
+        assertEq(asset.balanceOf(address(destinationVault)), 100e6);
+        assertEq(earnVault.totalAssets(), 100e6);
+        assertEq(earnShare.balanceOf(user), 100e6);
+    }
+
+    function testMigrationCandidateRequiresCommittedTargetAndCannotBecomeFreshStack() public {
+        (, EarnVault earnVault,) = _migratableStack(STACK_A);
+        vm.prank(operator);
+        address ordinary = factory.deployEngine(_nextJob(), _engineParams());
+        vm.prank(stackOwner);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.MigrationTargetMissing.selector, ordinary));
+        factory.finalizeMigrationEngine(ordinary);
+
+        vm.prank(operator);
+        address reserved = factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+        vm.prank(operator);
+        vm.expectRevert(
+            abi.encodeWithSelector(VedaStackFactory.MigrationTargetReserved.selector, reserved, address(earnVault))
+        );
+        factory.finalizeStack(reserved, _coreParams(STACK_B), address(0));
+        assertEq(uint256(factory.stack(reserved).status), uint256(VedaStackFactory.EngineStatus.Pending));
+        assertFalse(_canCall(reserved, address(teller), ITeller.bulkDeposit.selector));
+    }
+
+    function testMigrationCandidateUsesLiveEarnVaultOperatorAndCannotBeFinalizedTwice() public {
+        (, EarnVault earnVault,) = _migratableStack(STACK_A);
+        vm.prank(operator);
+        address replacement = factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.NotEarnVaultOperator.selector, stranger, stackOwner));
+        factory.finalizeMigrationEngine(replacement);
+        vm.prank(stackOwner);
+        earnVault.transferOperator(admin);
+        vm.prank(admin);
+        earnVault.acceptOperator();
+        vm.prank(stackOwner);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.NotEarnVaultOperator.selector, stackOwner, admin));
+        factory.finalizeMigrationEngine(replacement);
+        vm.prank(admin);
+        factory.finalizeMigrationEngine(replacement);
+        assertEq(VedaEngine(replacement).owner(), admin);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotPending.selector, replacement));
+        factory.finalizeMigrationEngine(replacement);
+    }
+
+    function testMigrationCandidateRejectsDisabledModeAssetMismatchAndUnboundSource() public {
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.InvalidMigrationTarget.selector, stranger));
+        factory.deployMigrationEngine(_nextJob(), _engineParams(), stranger);
+
+        EarnFactory.DeployParams memory disabledParams = _coreParams(STACK_A);
+        disabledParams.controls.migrationMode = EngineMigrationMode.UserOnly;
+        vm.prank(operator);
+        (, address disabledAddress,) = factory.createStack(_nextJob(), _engineParams(), disabledParams, address(0));
+        EarnVault disabled = EarnVault(disabledAddress);
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.MigrationDisabled.selector, address(disabled)));
+        factory.deployMigrationEngine(_nextJob(), _engineParams(), address(disabled));
+
+        (VedaEngine oldEngine, EarnVault earnVault,) = _migratableStack(STACK_B);
+        vm.mockCall(address(earnVault), abi.encodeWithSelector(IEarnVault.asset.selector), abi.encode(stranger));
+        vm.prank(operator);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                VedaStackFactory.MigrationAssetMismatch.selector, address(earnVault), address(asset), stranger
+            )
+        );
+        factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+        vm.clearMockedCalls();
+
+        vm.mockCall(address(oldEngine), abi.encodeWithSelector(IEarnEngine.earnVault.selector), abi.encode(stranger));
+        vm.prank(operator);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                VedaStackFactory.InvalidMigrationSource.selector, address(earnVault), address(oldEngine)
+            )
+        );
+        factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+    }
+
+    function testMigrationCandidateRechecksSourceAndJobBeforeGrantingRoles() public {
+        (VedaEngine oldEngine, EarnVault earnVault,) = _migratableStack(STACK_A);
+        bytes32 jobId = _nextJob();
+        vm.prank(operator);
+        address replacement = factory.deployMigrationEngine(jobId, _engineParams(), address(earnVault));
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.JobAlreadyBuilt.selector, jobId, replacement));
+        factory.deployMigrationEngine(jobId, _engineParams(), address(earnVault));
+
+        vm.mockCall(address(oldEngine), abi.encodeWithSelector(IEarnEngine.earnVault.selector), abi.encode(stranger));
+        vm.prank(stackOwner);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                VedaStackFactory.InvalidMigrationSource.selector, address(earnVault), address(oldEngine)
+            )
+        );
+        factory.finalizeMigrationEngine(replacement);
+        vm.clearMockedCalls();
+        assertEq(uint256(factory.stack(replacement).status), uint256(VedaStackFactory.EngineStatus.Pending));
+        assertFalse(_canCall(replacement, address(teller), ITeller.bulkDeposit.selector));
+    }
+
+    function testMigrationCandidateStalePausedDiscardedAndFailedGrantRemainInert() public {
+        (, EarnVault earnVault,) = _migratableStack(STACK_A);
+        vm.prank(operator);
+        address stale = factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+        AuthedTeller newTeller = new AuthedTeller(address(0), address(rolesAuthority), vault, address(accountant));
+        _rotate(newTeller, queue, solver);
+        vm.prank(stackOwner);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EnginePeripheryStale.selector, stale, 1, 2));
+        factory.finalizeMigrationEngine(stale);
+        vm.prank(pauser);
+        factory.discardEngine(stale);
+        vm.prank(stackOwner);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotPending.selector, stale));
+        factory.finalizeMigrationEngine(stale);
+
+        vm.prank(operator);
+        address fresh = factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+        vm.prank(pauser);
+        factory.pauseRegistrations();
+        vm.prank(stackOwner);
+        vm.expectRevert(VedaStackFactory.RegistrationsPaused.selector);
+        factory.finalizeMigrationEngine(fresh);
+        vm.prank(admin);
+        factory.resumeRegistrations();
+
+        _dropForwarderAccess();
+        vm.prank(stackOwner);
+        vm.expectPartialRevert(VedaStackFactory.NotAuthorizedOnVeda.selector);
+        factory.finalizeMigrationEngine(fresh);
+        assertEq(uint256(factory.stack(fresh).status), uint256(VedaStackFactory.EngineStatus.Pending));
+        assertEq(VedaEngine(fresh).earnVault(), address(0));
+        assertFalse(_canCall(fresh, address(newTeller), ITeller.bulkDeposit.selector));
+    }
+
+    function _migratableStack(bytes32 deploymentId)
+        internal
+        returns (VedaEngine engine, EarnVault earnVault, StackMockShareToken earnShare)
+    {
+        EarnFactory.DeployParams memory params = _coreParams(deploymentId);
+        params.controls.migrationMode = EngineMigrationMode.OperatorEnabled;
+        vm.prank(operator);
+        (address engine_, address earnVault_, address earnShare_) =
+            factory.createStack(_nextJob(), _engineParams(), params, address(0));
+        return (VedaEngine(engine_), EarnVault(earnVault_), StackMockShareToken(earnShare_));
+    }
+
+    function _newImmediateDestination()
+        internal
+        returns (
+            VedaStackFactory destinationFactory,
+            AuthedBoringVault destinationVault,
+            AuthedTeller destinationTeller
+        )
+    {
+        MockRolesAuthority destinationRoles = new MockRolesAuthority(admin, address(0));
+        destinationVault = new AuthedBoringVault(address(0), address(destinationRoles), 6);
+        MockAccountant destinationAccountant =
+            new MockAccountant(MockBoringVault(address(destinationVault)), address(asset));
+        destinationTeller =
+            new AuthedTeller(address(0), address(destinationRoles), destinationVault, address(destinationAccountant));
+        VedaVaultRegistry destinationRegistry =
+            new VedaVaultRegistry(IBoringVault(address(destinationVault)), address(asset));
+        vm.startPrank(admin);
+        destinationRoles.setRoleCapability(
+            MINTER_ROLE, address(destinationVault), IBoringVaultCustody.enter.selector, true
+        );
+        destinationRoles.setRoleCapability(
+            BURNER_ROLE, address(destinationVault), IBoringVaultCustody.exit.selector, true
+        );
+        destinationRoles.setUserRole(address(destinationTeller), MINTER_ROLE, true);
+        destinationRoles.setUserRole(address(destinationTeller), BURNER_ROLE, true);
+        destinationRegistry.publish(
+            ITeller(address(destinationTeller)),
+            IBoringQueue(address(0)),
+            IAccountant(address(destinationAccountant)),
+            IBoringSolver(address(0))
+        );
+
+        VedaRoleGranter destinationGranter = new VedaRoleGranter(
+            IRolesAuthority(address(destinationRoles)),
+            IVedaVaultRegistry(address(destinationRegistry)),
+            EARN_ENGINE_ROLE,
+            EARN_FORWARDER_ROLE
+        );
+        VedaStackFactory.Config memory config = _factoryConfig();
+        config.registry = IVedaVaultRegistry(address(destinationRegistry));
+        config.authorizer = IVedaStackAuthorizer(address(destinationGranter));
+        destinationFactory = new VedaStackFactory(config);
+        destinationRoles.setRoleCapability(
+            EARN_ENGINE_ROLE, address(destinationTeller), ITeller.bulkDeposit.selector, true
+        );
+        destinationRoles.setRoleCapability(
+            EARN_ENGINE_ROLE, address(destinationTeller), ITeller.bulkWithdraw.selector, true
+        );
+        destinationRoles.setAuthority(address(destinationGranter));
+        destinationGranter.setFactory(address(destinationFactory), true);
+        destinationGranter.assertSetup(IVedaVaultRegistry(address(destinationRegistry)), address(destinationFactory));
+        vm.stopPrank();
     }
 
     function testFinalizeAcceptsOnlyAnEngineThisFactoryDeployedAndOnlyOnce() public {
@@ -1085,6 +1384,57 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         assertFalse(factory.closedToNewStacks());
         (, EarnVault secondVault,) = _createStack(STACK_B);
         assertEq(_deposit(secondVault, user, 5e6), 5e6);
+    }
+
+    function testAClosedFactoryFinishesAMigrationItAlreadyStartedAndStartsNoOther() public {
+        (VedaEngine oldEngine, EarnVault earnVault,) = _migratableStack(STACK_A);
+        _deposit(earnVault, user, 100e6);
+        vm.startPrank(operator);
+        address replacement = factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+        address setAside = factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+        vm.stopPrank();
+
+        vm.prank(admin);
+        factory.setClosedToNewStacks(true);
+
+        // No further candidate is deployed.
+        uint256 engines = factory.engineCount();
+        vm.prank(operator);
+        vm.expectRevert(VedaStackFactory.FactoryClosedToNewStacks.selector);
+        factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+        assertEq(factory.engineCount(), engines);
+
+        // A pauser can still set a candidate aside, and a pause still stops a finalization.
+        vm.prank(pauser);
+        factory.discardEngine(setAside);
+        vm.prank(stackOwner);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotPending.selector, setAside));
+        factory.finalizeMigrationEngine(setAside);
+        vm.prank(pauser);
+        factory.pauseRegistrations();
+        vm.prank(stackOwner);
+        vm.expectRevert(VedaStackFactory.RegistrationsPaused.selector);
+        factory.finalizeMigrationEngine(replacement);
+        vm.prank(admin);
+        factory.resumeRegistrations();
+        assertTrue(factory.closedToNewStacks());
+
+        // The candidate deployed before closing is still the EarnVault operator's to finish, and only theirs.
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.NotEarnVaultOperator.selector, operator, stackOwner));
+        factory.finalizeMigrationEngine(replacement);
+        vm.prank(stackOwner);
+        address forwarder = factory.finalizeMigrationEngine(replacement);
+        assertEq(uint256(factory.stack(replacement).status), uint256(VedaStackFactory.EngineStatus.Active));
+        assertTrue(factory.isEngineReady(replacement));
+        assertTrue(VedaEngine(replacement).authorizedForwarder(forwarder));
+
+        vm.prank(stackOwner);
+        earnVault.migrateEngine(replacement, 100e6, 100e6);
+        assertEq(earnVault.engine(), replacement);
+        assertEq(oldEngine.totalShares(), 0);
+        assertEq(VedaEngine(replacement).totalShares(), 100e6);
+        assertEq(_deposit(earnVault, user, 1e6), 1e6);
     }
 
     function testOnlyTheAdministratorClosesAndOpensAFactory() public {
