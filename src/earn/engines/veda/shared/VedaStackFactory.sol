@@ -44,8 +44,11 @@ import { VedaEngineDeployer, VedaForwardingSolverDeployer } from "./VedaStackDep
 ///      only to contracts it built itself:
 ///      - an engine comes from the pinned engine deployer in this contract's own call and is owned by
 ///        this contract until binding. A fresh stack binds to the EarnVault the pinned `EarnFactory`
-///        just produced; a migration candidate is committed to an existing EarnVault at deployment
-///        and binds only when that EarnVault's current operator calls here. This contract never
+///        just produced; a migration candidate is committed at deployment to the contract the
+///        operator names as an existing EarnVault, and binds only when the account that contract
+///        reports as its operator calls here. Nothing proves that contract is an EarnVault, so a
+///        candidate is bounded like a fresh stack: by the operator that deployed it still being the
+///        operator, and by {requiredStackOwner}. This contract never
 ///        authorizes an engine it did not own from construction to binding;
 ///      - a forwarding solver comes from the pinned forwarder deployer, is fixed to one recorded
 ///        engine and the vault's published Queue, Teller and stock solver, and is owned by the
@@ -54,11 +57,13 @@ import { VedaEngineDeployer, VedaForwardingSolverDeployer } from "./VedaStackDep
 ///
 ///      WHO CALLS IT. `operator` builds stacks and inert migration candidates, and never may be opened
 ///      to everyone: an engine's
-///      deposits and exits skip the Teller's share lock, so a stack's owner can enter before a rate
-///      update and leave after it at the other holders' expense, and each stack picks its own EarnShare
-///      transfer policy. The operator chooses each stack's owner, fees, controls, rate age bound and
-///      transfer policy; this contract restricts only the owner, and only once the administrator has
-///      set {requiredStackOwner}. That is the whole reach of a leaked
+///      deposits and exits skip the Teller's share lock, so anyone a stack admits can enter before a
+///      rate update and leave after it at the other holders' expense, and each stack picks its own
+///      fees and EarnShare transfer policy. The operator chooses each stack's owner, fees, controls,
+///      rate age bound and transfer policy; this contract restricts only the owner, and only once the
+///      administrator has set {requiredStackOwner}. Fixing the owner fixes who administers a stack,
+///      not that exposure: a stack built for the required owner with no fees and an open transfer
+///      policy still admits everyone. That is the whole reach of a leaked
 ///      operator key: stacks of its choosing, with that timing exposure, which dilutes every holder of
 ///      the BoringVault, and further forwarding solvers for existing stacks, which settle nothing until
 ///      an engine's owner admits them. It never reaches a role, the registry, another stack's settings
@@ -178,14 +183,16 @@ contract VedaStackFactory {
 
     /// @notice The only account that builds stacks.
     address public operator;
-    /// @notice While set, no engine, stack or forwarding solver is built or authorized.
+    /// @notice While set, no engine, stack or forwarding solver is built, and none is authorized
+    ///         except by the administrator reinstating one that was revoked.
     bool public registrationsPaused;
     /// @notice While set, no engine is deployed and no new stack is finalized. Forwarding solvers are
     ///         still built for the stacks this factory already has, so they can follow a publication,
     ///         and a migration candidate deployed before closing can still be finalized.
     bool public closedToNewStacks;
-    /// @notice When nonzero, the only `core.owner` a new stack may be built for. Zero leaves the
-    ///         choice to the operator. Set by the vault's administrator ({setRequiredStackOwner}).
+    /// @notice When nonzero, the only `core.owner` a new stack may be built for, and the only
+    ///         EarnVault operator a migration candidate is finalized for. Zero leaves the choice to
+    ///         the operator. Set by the vault's administrator ({setRequiredStackOwner}).
     /// @dev Declared after the flags above so that they stay in the operator's slot, which every
     ///      operator call reads. Checked when a stack is built and never afterwards: a stack's owner
     ///      can still hand its EarnVault and its engine on later, and this contract has no say in that.
@@ -228,6 +235,7 @@ contract VedaStackFactory {
 
     error AmbiguousTransferPolicy(uint64 transferPolicyId, address newPolicyAdmin);
     error AuthorizerNotBound();
+    error CandidateOperatorReplaced(address engine, address creator, address operator);
     error CodeHashMismatch(address account, bytes32 expected, bytes32 actual);
     error EmptyJobId();
     error EngineMustBeUnset(address engine);
@@ -406,14 +414,24 @@ contract VedaStackFactory {
     /// @dev Stopped by a pause and not by {closedToNewStacks}: a closed factory deploys no further
     ///      candidate, and one it deployed before closing is the EarnVault operator's to finish. A
     ///      pauser can still set such a candidate aside with {discardEngine}.
+    ///
+    ///      The caller is whoever the target reports as its operator, and the target is whatever
+    ///      contract the deploying operator named. So this call is bounded as the operator's own
+    ///      calls are: a candidate deployed by an operator that has since been replaced is never
+    ///      finalized, the target's operator must be {requiredStackOwner} when one is set, and a
+    ///      stack this factory has revoked gets no candidate.
     function finalizeMigrationEngine(address engine) external nonReentrant returns (address forwarder) {
         if (registrationsPaused) revert RegistrationsPaused();
         StackRecord storage record = _stacks[engine];
         if (record.status != EngineStatus.Pending) revert EngineNotPending(engine);
         address earnVault = migrationTargetOf[engine];
         if (earnVault == address(0)) revert MigrationTargetMissing(engine);
+        address creator = record.creator;
+        if (creator != operator) revert CandidateOperatorReplaced(engine, creator, operator);
         (address owner, address oldEngine) = _migrationOperator(earnVault);
         if (msg.sender != owner) revert NotEarnVaultOperator(msg.sender, owner);
+        address required = requiredStackOwner;
+        if (required != address(0) && owner != required) revert StackOwnerNotAllowed(owner, required);
         _requireAuthorizerBound();
 
         VedaEngine candidate = VedaEngine(engine);
@@ -543,12 +561,15 @@ contract VedaStackFactory {
     }
 
     /// @notice Fixes the owner every new stack must be built for, or lifts that with zero.
-    /// @dev Bounds the operator key, which otherwise chooses each stack's owner. It applies to stacks
-    ///      built from now on ({createStack}, {finalizeStack}) and to nothing already built. It is not
-    ///      applied to a migration candidate, which goes to its EarnVault's current operator, and it
-    ///      does not stop a stack's owner from transferring its EarnVault and engine later.
+    /// @dev Bounds whom the operator key can make the owner of an engine that holds a role. It applies
+    ///      to what is finalized from now on ({createStack}, {finalizeStack},
+    ///      {finalizeMigrationEngine}) and to nothing already built. It does not stop a stack's owner
+    ///      from transferring its EarnVault and engine later; such a stack then migrates through this
+    ///      factory only while the administrator has pointed this at its new owner. It does not bound
+    ///      a stack's fees, controls or transfer policy.
     function setRequiredStackOwner(address newOwner) external onlyVaultAdmin {
-        if (newOwner == address(this)) revert FactoryCannotBeOwner();
+        // Neither factory can be a stack's owner, so either would make every build revert.
+        if (newOwner == address(this) || newOwner == address(earnFactory)) revert FactoryCannotBeOwner();
         emit RequiredStackOwnerChanged(requiredStackOwner, newOwner, msg.sender);
         requiredStackOwner = newOwner;
     }
@@ -646,17 +667,22 @@ contract VedaStackFactory {
         return _canCall(stockSolver, teller, ITeller.bulkWithdraw.selector);
     }
 
-    /// @notice Reverts unless `engine` is a migration candidate this factory prepared, still
-    ///         authorized, whose owner is its EarnVault's current operator.
+    /// @notice Reverts unless `engine` is a migration candidate this factory prepared and has not
+    ///         revoked, allowed on its Teller and Queue, whose owner is its EarnVault's current
+    ///         operator.
     /// @dev For the EarnVault operator's batch, immediately before `migrateEngine`, whenever
     ///      {finalizeMigrationEngine} was an earlier transaction. A candidate goes to the operator who
     ///      finalizes it, an EarnVault's operator can change afterwards, and `migrateEngine` does not
     ///      look at the engine's owner: without this check a new operator could move the pool into
-    ///      an engine the former operator still administers.
+    ///      an engine the former operator still administers. It compares the two seats and nothing
+    ///      else the former operator may have set on the engine, such as its forwarder list: an
+    ///      operator who did not finalize a candidate itself prepares another instead of taking it over.
     function assertMigrationCurrent(address engine) external view {
         address earnVault = migrationTargetOf[engine];
         if (earnVault == address(0)) revert MigrationTargetMissing(engine);
         if (_stacks[engine].status != EngineStatus.Active) revert EngineNotActive(engine);
+        (address target, bytes4 functionSig) = _firstRefusedCall(engine);
+        if (target != address(0)) revert NotAuthorizedOnVeda(engine, target, functionSig);
         address engineOwner = VedaEngine(engine).owner();
         address earnVaultOperator = IEarnVault(earnVault).operator();
         if (engineOwner != earnVaultOperator) revert MigrationOwnerStale(engine, engineOwner, earnVaultOperator);
@@ -769,6 +795,9 @@ contract VedaStackFactory {
         if (oldEngine.code.length == 0 || IEarnEngine(oldEngine).earnVault() != earnVault) {
             revert InvalidMigrationSource(earnVault, oldEngine);
         }
+        // Revoking a stack stops the stack, not one engine of it: it gets no replacement here until
+        // the administrator reinstates it.
+        if (_stacks[oldEngine].status == EngineStatus.Revoked) revert EngineNotActive(oldEngine);
         owner = target.operator();
         if (owner == address(0) || owner == address(this)) revert InvalidMigrationTarget(earnVault);
     }
