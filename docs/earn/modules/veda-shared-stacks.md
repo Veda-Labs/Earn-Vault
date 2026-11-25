@@ -132,7 +132,7 @@ fixture TIP-20 factory and Veda modules, against the 30M per-transaction cap:
 | `createStack`, vault with a Queue   | 30.3M                     | 30.5M                                                |
 | `createStack`, immediate-only vault | 24.5M                     | 24.5M                                                |
 | `deployEngine`                      | 14.7M                     | 14.7M                                                |
-| `finalizeStack`, vault with a Queue | 15.7M                     | 15.9M                                                |
+| `finalizeStack`, vault with a Queue | 15.7M                     | 16.0M                                                |
 
 On Tempo a vault with a Queue needs the two-call path: one call is over the cap. The figures come
 from fixtures, not the live precompiles. The steward column has one listed solver; each further
