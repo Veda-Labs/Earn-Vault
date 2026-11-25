@@ -11,6 +11,7 @@ import { IForwardingEngine, VedaForwardingSolver } from "../../../../../src/earn
 import { VedaForwarderSteward } from "../../../../../src/earn/engines/veda/shared/VedaForwarderSteward.sol";
 import { VedaEngine } from "../../../../../src/earn/engines/veda/VedaEngine.sol";
 import { VedaStackFactory } from "../../../../../src/earn/engines/veda/shared/VedaStackFactory.sol";
+import { ITeller } from "../../../../../src/interfaces/external/veda/ITeller.sol";
 import { IBoringQueue } from "../../../../../src/interfaces/external/veda/IBoringQueue.sol";
 import { IBoringSolver } from "../../../../../src/interfaces/external/veda/IBoringSolver.sol";
 import { AuthedQueue, AuthedSolver } from "../../../helpers/VedaAuthMocks.sol";
@@ -86,6 +87,31 @@ contract VedaForwarderStewardTest is VedaRoleStackTestBase {
         config.forwarderTreasury = address(steward);
         vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.InvalidFactoryWiring.selector, address(steward)));
         new VedaStackFactory(config);
+    }
+
+    function testAStewardIsPinnedByItsCodeHash() public {
+        assertEq(factory.forwarderStewardCodeHash(), address(steward).codehash);
+
+        // A contract that is not the reviewed steward is refused, whatever it answers.
+        VedaStackFactory.Config memory config = _factoryConfig();
+        config.forwarderOwner = address(registry);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                VedaStackFactory.CodeHashMismatch.selector,
+                address(registry),
+                address(steward).codehash,
+                address(registry).codehash
+            )
+        );
+        new VedaStackFactory(config);
+
+        // A factory whose forwarders have a plain owner names no steward hash.
+        config = _factoryConfig();
+        config.forwarderOwnerIsSteward = false;
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.InvalidFactoryWiring.selector, address(steward)));
+        new VedaStackFactory(config);
+        config.forwarderStewardCodeHash = bytes32(0);
+        assertEq(new VedaStackFactory(config).forwarderStewardCodeHash(), bytes32(0));
     }
 
     function testAForwarderNoListedSolverCouldTriggerIsNotBuilt() public {
@@ -306,6 +332,26 @@ contract VedaForwarderStewardTest is VedaRoleStackTestBase {
         vm.prank(admin);
         rolesAuthority.setUserRole(forwarder, EARN_FORWARDER_ROLE, true);
         assertTrue(factory.isForwarderReady(forwarder, solverBot));
+
+        // The stock solver loses, one at a time, each permission its own part of a settlement needs:
+        // solving on the Queue, being called back by the Queue, and redeeming on the Teller.
+        bytes4 solveSig = AuthedQueue.solveOnChainWithdraws.selector;
+        bytes4 callbackSig = AuthedSolver.boringSolve.selector;
+        bytes4 redeemSig = ITeller.bulkWithdraw.selector;
+        vm.startPrank(admin);
+        rolesAuthority.setRoleCapability(STOCK_SOLVER_ROLE, address(queue), solveSig, false);
+        assertFalse(factory.isForwarderReady(forwarder, solverBot));
+        rolesAuthority.setRoleCapability(STOCK_SOLVER_ROLE, address(queue), solveSig, true);
+        assertTrue(factory.isForwarderReady(forwarder, solverBot));
+        rolesAuthority.setRoleCapability(QUEUE_ROLE, address(solver), callbackSig, false);
+        assertFalse(factory.isForwarderReady(forwarder, solverBot));
+        rolesAuthority.setRoleCapability(QUEUE_ROLE, address(solver), callbackSig, true);
+        assertTrue(factory.isForwarderReady(forwarder, solverBot));
+        rolesAuthority.setRoleCapability(STOCK_SOLVER_ROLE, address(teller), redeemSig, false);
+        assertFalse(factory.isForwarderReady(forwarder, solverBot));
+        rolesAuthority.setRoleCapability(STOCK_SOLVER_ROLE, address(teller), redeemSig, true);
+        assertTrue(factory.isForwarderReady(forwarder, solverBot));
+        vm.stopPrank();
 
         // The vault publishes another Queue. The engine keeps the old one until its owner activates
         // the publication, so its forwarder is still the one that settles.
