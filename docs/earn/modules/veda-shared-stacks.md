@@ -132,7 +132,7 @@ fixture TIP-20 factory and Veda modules, against the 30M per-transaction cap:
 | `createStack`, vault with a Queue   | 30.3M                     | 30.5M                                                |
 | `createStack`, immediate-only vault | 24.5M                     | 24.5M                                                |
 | `deployEngine`                      | 14.7M                     | 14.7M                                                |
-| `finalizeStack`, vault with a Queue | 15.7M                     | 15.9M                                                |
+| `finalizeStack`, vault with a Queue | 15.7M                     | 16.0M                                                |
 
 On Tempo a vault with a Queue needs the two-call path: one call is over the cap. The figures come
 from fixtures, not the live precompiles. The steward column has one listed solver; each further
@@ -141,17 +141,25 @@ solver adds a storage write to every forwarder built.
 core first and make it revert; finalize again under another `deploymentId`. Such a core is bound to
 nothing and holds nothing.
 
-| Caller             | Functions                                                                                             |
-| ------------------ | ----------------------------------------------------------------------------------------------------- |
-| Operator           | `createStack`, `deployEngine`, `deployMigrationEngine`, `finalizeStack`, `deployForwarder`            |
-| EarnVault operator | `finalizeMigrationEngine` for an Engine committed to that EarnVault                                   |
-| Pausers            | `revokeEngine`, `revokeForwarder`, `pauseRegistrations`, `discardEngine`                              |
-| Administrator      | The pausers' functions, `reinstateEngine`, `reinstateForwarder`, `resumeRegistrations`, `setOperator` |
+| Caller             | Functions                                                                                                                     |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| Operator           | `createStack`, `deployEngine`, `deployMigrationEngine`, `finalizeStack`, `deployForwarder`                                    |
+| EarnVault operator | `finalizeMigrationEngine` for an Engine committed to that EarnVault                                                           |
+| Pausers            | `revokeEngine`, `revokeForwarder`, `pauseRegistrations`, `discardEngine`                                                      |
+| Administrator      | The pausers' functions, `reinstateEngine`, `reinstateForwarder`, `resumeRegistrations`, `setClosedToNewStacks`, `setOperator` |
 
 Pausers are the accounts the BoringVault's authority allows to call that function on the factory;
 the administrator grants those capabilities to the vault's pause roles. Pausing and revoking only
 reduce what the factory and its stacks can do. A paused factory refuses every operator call and
 every migration candidate finalization.
+
+Pausing is for incidents. A factory that should only stop taking new stacks is closed by the
+administrator with `setClosedToNewStacks(true)`: it then deploys no engine and finalizes no new stack,
+an engine left pending included (`FactoryClosedToNewStacks`), and `deployForwarder` still works, so
+its existing stacks can follow a change of Queue, stock solver or Teller. A closed factory also
+refuses `deployMigrationEngine`, and still lets an EarnVault's operator call `finalizeMigrationEngine`
+for a candidate deployed before it closed; a pauser stops that candidate with `discardEngine`. Closing
+changes nothing else, and a closed factory can still be paused.
 
 The records say what the factory last did, not what the module authorities permit now.
 `isEngineReady(engine)` checks the active factory record and the Engine's authority on its current
@@ -333,8 +341,10 @@ destination cap, rates, roles, and migration floors.
 ### Replacing the factory
 
 A new release uses a new factory against the same registry and granter. The administrator names it
-beside the old one. Keep the old factory named while its stacks need factory-mediated revocation,
-reinstatement or new forwarding solvers, but pause its registrations. Once the administrator stops
+beside the old one and, in the same batch, closes the old one to new stacks
+(`setClosedToNewStacks(true)`). Keep the old factory named while its stacks need factory-mediated
+revocation, reinstatement or new forwarding solvers. Do not leave it paused: only the factory that
+built a stack can build its forwarders, and a paused factory builds none. Once the administrator stops
 naming a factory, its existing roles remain and only the RolesAuthority owner can revoke them
 directly. The factory's own records do not change.
 

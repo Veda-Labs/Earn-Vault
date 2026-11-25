@@ -146,6 +146,7 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         address creator
     );
     event TransferPolicyCreated(uint64 indexed policyId, address indexed admin);
+    event ClosedToNewStacksChanged(bool closed, address indexed by);
 
     // ------------------------------------------------------------------
     // Building a stack
@@ -1324,6 +1325,161 @@ abstract contract VedaStackFactoryBehavior is VedaStackTestBase {
         factory.resumeRegistrations();
         vm.prank(operator);
         factory.finalizeStack(pendingEngine, _coreParams(STACK_B), address(0));
+    }
+
+    function testAClosedFactoryTakesNoNewStackAndStillServesTheStacksItHas() public {
+        vm.prank(operator);
+        address pendingEngine = factory.deployEngine(_nextJob(), _engineParams());
+        (VedaEngine engine, EarnVault earnVault, StackMockShareToken earnShare) = _createStack(STACK_A);
+        _deposit(earnVault, user, 100e6);
+
+        vm.expectEmit(address(factory));
+        emit ClosedToNewStacksChanged(true, admin);
+        vm.prank(admin);
+        factory.setClosedToNewStacks(true);
+        assertTrue(factory.closedToNewStacks());
+        assertFalse(factory.registrationsPaused());
+
+        // No new engine and no new stack, an engine left pending included.
+        uint256 engines = factory.engineCount();
+        vm.startPrank(operator);
+        vm.expectRevert(VedaStackFactory.FactoryClosedToNewStacks.selector);
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK_B), address(0));
+        vm.expectRevert(VedaStackFactory.FactoryClosedToNewStacks.selector);
+        factory.deployEngine(_nextJob(), _engineParams());
+        vm.expectRevert(VedaStackFactory.FactoryClosedToNewStacks.selector);
+        factory.finalizeStack(pendingEngine, _coreParams(STACK_B), address(0));
+        vm.stopPrank();
+        assertEq(factory.engineCount(), engines);
+        assertEq(uint256(factory.stack(pendingEngine).status), uint256(VedaStackFactory.EngineStatus.Pending));
+        assertFalse(_canCall(pendingEngine, address(teller), ITeller.bulkDeposit.selector));
+
+        // The vault changes its Queue and stock solver. The closed factory still builds the forwarder
+        // its stack needs, and the queued path works on the new modules.
+        (AuthedQueue newQueue, AuthedSolver newSolver) = _newExitRail(address(accountant));
+        _rotate(teller, newQueue, newSolver);
+        vm.prank(operator);
+        address newForwarder = factory.deployForwarder(address(engine));
+        vm.prank(stackOwner);
+        engine.setAuthorizedForwarder(newForwarder, true);
+        _activate(engine, earnVault);
+        assertEq(address(engine.queue()), address(newQueue));
+        assertTrue(factory.isEngineReady(address(engine)));
+        bytes32 requestId = _requestRedeem(earnVault, earnShare, user, 15e6);
+        assertEq(_solve(VedaForwardingSolver(newForwarder), requestId), 1);
+        assertEq(asset.balanceOf(user), 15e6);
+
+        // Pausers keep their levers over a closed factory, and the administrator its restores.
+        vm.prank(pauser);
+        factory.revokeEngine(address(engine));
+        vm.prank(admin);
+        factory.reinstateEngine(address(engine));
+        assertEq(_deposit(earnVault, user, 1e6), 1e6);
+
+        // Opened again, it builds stacks as before.
+        vm.expectEmit(address(factory));
+        emit ClosedToNewStacksChanged(false, admin);
+        vm.prank(admin);
+        factory.setClosedToNewStacks(false);
+        assertFalse(factory.closedToNewStacks());
+        (, EarnVault secondVault,) = _createStack(STACK_B);
+        assertEq(_deposit(secondVault, user, 5e6), 5e6);
+    }
+
+    function testAClosedFactoryFinishesAMigrationItAlreadyStartedAndStartsNoOther() public {
+        (VedaEngine oldEngine, EarnVault earnVault,) = _migratableStack(STACK_A);
+        _deposit(earnVault, user, 100e6);
+        vm.startPrank(operator);
+        address replacement = factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+        address setAside = factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+        vm.stopPrank();
+
+        vm.prank(admin);
+        factory.setClosedToNewStacks(true);
+
+        // No further candidate is deployed.
+        uint256 engines = factory.engineCount();
+        vm.prank(operator);
+        vm.expectRevert(VedaStackFactory.FactoryClosedToNewStacks.selector);
+        factory.deployMigrationEngine(_nextJob(), _engineParams(), address(earnVault));
+        assertEq(factory.engineCount(), engines);
+
+        // A pauser can still set a candidate aside, and a pause still stops a finalization.
+        vm.prank(pauser);
+        factory.discardEngine(setAside);
+        vm.prank(stackOwner);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.EngineNotPending.selector, setAside));
+        factory.finalizeMigrationEngine(setAside);
+        vm.prank(pauser);
+        factory.pauseRegistrations();
+        vm.prank(stackOwner);
+        vm.expectRevert(VedaStackFactory.RegistrationsPaused.selector);
+        factory.finalizeMigrationEngine(replacement);
+        vm.prank(admin);
+        factory.resumeRegistrations();
+        assertTrue(factory.closedToNewStacks());
+
+        // The candidate deployed before closing is still the EarnVault operator's to finish, and only theirs.
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.NotEarnVaultOperator.selector, operator, stackOwner));
+        factory.finalizeMigrationEngine(replacement);
+        vm.prank(stackOwner);
+        address forwarder = factory.finalizeMigrationEngine(replacement);
+        assertEq(uint256(factory.stack(replacement).status), uint256(VedaStackFactory.EngineStatus.Active));
+        assertTrue(factory.isEngineReady(replacement));
+        assertTrue(VedaEngine(replacement).authorizedForwarder(forwarder));
+
+        vm.prank(stackOwner);
+        earnVault.migrateEngine(replacement, 100e6, 100e6);
+        assertEq(earnVault.engine(), replacement);
+        assertEq(oldEngine.totalShares(), 0);
+        assertEq(VedaEngine(replacement).totalShares(), 100e6);
+        assertEq(_deposit(earnVault, user, 1e6), 1e6);
+    }
+
+    function testOnlyTheAdministratorClosesAndOpensAFactory() public {
+        address[3] memory nonAdmins = [operator, pauser, stranger];
+        for (uint256 i = 0; i < nonAdmins.length; i++) {
+            vm.prank(nonAdmins[i]);
+            vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.NotVaultAdmin.selector, nonAdmins[i]));
+            factory.setClosedToNewStacks(true);
+        }
+        assertFalse(factory.closedToNewStacks());
+
+        vm.prank(admin);
+        factory.setClosedToNewStacks(true);
+        for (uint256 i = 0; i < nonAdmins.length; i++) {
+            vm.prank(nonAdmins[i]);
+            vm.expectRevert(abi.encodeWithSelector(VedaStackFactory.NotVaultAdmin.selector, nonAdmins[i]));
+            factory.setClosedToNewStacks(false);
+        }
+        assertTrue(factory.closedToNewStacks());
+    }
+
+    function testAPauseStillStopsAClosedFactorysForwarders() public {
+        (VedaEngine engine,,) = _createStack(STACK_A);
+        vm.prank(admin);
+        factory.setClosedToNewStacks(true);
+        vm.prank(pauser);
+        factory.pauseRegistrations();
+
+        // The incident lever is whole: one call stops everything the operator key can do.
+        vm.startPrank(operator);
+        vm.expectRevert(VedaStackFactory.RegistrationsPaused.selector);
+        factory.deployForwarder(address(engine));
+        vm.expectRevert(VedaStackFactory.RegistrationsPaused.selector);
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK_B), address(0));
+        vm.stopPrank();
+
+        // Resuming leaves the factory closed.
+        vm.prank(admin);
+        factory.resumeRegistrations();
+        assertTrue(factory.closedToNewStacks());
+        vm.startPrank(operator);
+        assertTrue(factory.deployForwarder(address(engine)) != address(0));
+        vm.expectRevert(VedaStackFactory.FactoryClosedToNewStacks.selector);
+        factory.createStack(_nextJob(), _engineParams(), _coreParams(STACK_B), address(0));
+        vm.stopPrank();
     }
 
     function testTheAdministratorMayAlsoPauseAndRevoke() public {
