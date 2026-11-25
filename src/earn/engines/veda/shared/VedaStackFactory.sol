@@ -2,6 +2,8 @@
 pragma solidity ^0.8.36;
 
 import { IEarnVault } from "../../../../interfaces/earn/IEarnVault.sol";
+import { EngineMigrationMode } from "../../../../interfaces/earn/EarnVaultTypes.sol";
+import { IEarnEngine } from "../../../../interfaces/earn/engines/IEarnEngine.sol";
 import {
     IVedaForwarderSteward,
     IVedaStackAuthorizer,
@@ -26,10 +28,8 @@ import { VedaEngineDeployer, VedaForwardingSolverDeployer } from "./VedaStackDep
 
 /// @title VedaStackFactory
 /// @notice Builds complete Earn stacks on one BoringVault without a transaction from the vault's
-///         administrator. One operator call deploys a {VedaEngine}, creates its EarnVault, EarnShare
-///         and EarnFees through the canonical `EarnFactory`, deploys a forwarding solver when the vault
-///         has a Queue, binds the engine, has the vault's {VedaRoleGranter} admit it, and records the
-///         stack.
+///         administrator. It can also prepare a replacement Engine for an existing EarnVault when
+///         that vault's current operator approves the binding.
 ///
 /// @dev THE ENGINE IS THE RELEASED ONE. Every stack runs an unmodified `VedaEngine` whose periphery
 ///      registry is the vault's {VedaVaultRegistry}. The engine caches the tuple published when it is
@@ -41,17 +41,18 @@ import { VedaEngineDeployer, VedaForwardingSolverDeployer } from "./VedaStackDep
 ///      granter checks only that a factory reports the right registry and itself. From then on this
 ///      contract decides which addresses receive the engine and forwarder roles. It gives those roles
 ///      only to contracts it built itself:
-///      - an engine comes from the pinned engine deployer in this contract's own call, is owned by this
-///        contract until it is bound, and is bound to the EarnVault the pinned `EarnFactory` just
-///        produced for it. A canonical engine lets its owner bind any EarnVault, so checking an
-///        engine's code would not be enough; this contract never authorizes an engine it did not own
-///        from construction to binding;
+///      - an engine comes from the pinned engine deployer in this contract's own call and is owned by
+///        this contract until binding. A fresh stack binds to the EarnVault the pinned `EarnFactory`
+///        just produced; a migration candidate is committed to an existing EarnVault at deployment
+///        and binds only when that EarnVault's current operator calls here. This contract never
+///        authorizes an engine it did not own from construction to binding;
 ///      - a forwarding solver comes from the pinned forwarder deployer, is fixed to one recorded
 ///        engine and the vault's published Queue, Teller and stock solver, and is owned by the
 ///        deployment-fixed `forwarderOwner`.
 ///      It is not the vault's owner, holds no role, and has no path to the BoringVault.
 ///
-///      WHO CALLS IT. `operator` builds stacks, and never may be opened to everyone: an engine's
+///      WHO CALLS IT. `operator` builds stacks and inert migration candidates, and never may be opened
+///      to everyone: an engine's
 ///      deposits and exits skip the Teller's share lock, so a stack's owner can enter before a rate
 ///      update and leave after it at the other holders' expense, and each stack picks its own EarnShare
 ///      transfer policy. The operator chooses each stack's owner, fees, controls, rate age bound and
@@ -60,8 +61,9 @@ import { VedaEngineDeployer, VedaForwardingSolverDeployer } from "./VedaStackDep
 ///      the BoringVault, and further forwarding solvers for existing stacks, which settle nothing until
 ///      an engine's owner admits them. It never reaches a role, the registry, another stack's settings
 ///      or vault custody. The vault's pausers, and its administrator, can
-///      revoke an engine or a forwarder and pause new registrations; pausing is the first response to a
-///      leaked operator, since it stops every stack-building call at once. Only the administrator
+///      revoke an engine or a forwarder and pause new registrations; pausing also blocks migration
+///      candidate finalization. Pausing is the first response to a leaked operator, since it stops
+///      every stack-building call at once. Only the administrator
 ///      reinstates, resumes, or replaces the operator. Pausers are the accounts the BoringVault's
 ///      authority allows to call the pausing function on this contract.
 ///
@@ -89,6 +91,7 @@ contract VedaStackFactory {
         None,
         /// Deployed by this factory and owned by it; bound to nothing and authorized for nothing.
         Pending,
+        /// Bound and authorized; a migration candidate can be here before the EarnVault selects it.
         Active,
         Revoked,
         /// Deployed and never bound, then set aside for good: it can no longer be finalized.
@@ -170,6 +173,8 @@ contract VedaStackFactory {
     /// @notice The engine built for each job id; zero when no build under that id has landed. A job id
     ///         builds one engine, so a build that is sent twice lands once.
     mapping(bytes32 jobId => address engine) public engineOf;
+    /// @notice The existing EarnVault an engine was built to replace. Zero marks an ordinary new stack.
+    mapping(address engine => address earnVault) public migrationTargetOf;
     mapping(address engine => StackRecord) private _stacks;
     mapping(address forwarder => ForwarderRecord) private _forwarders;
     address[] private _engines;
@@ -177,6 +182,10 @@ contract VedaStackFactory {
     bool private transient _entered;
 
     event EngineDeployed(address indexed engine, address indexed creator, bytes32 indexed jobId);
+    event MigrationEngineDeployed(address indexed engine, address indexed earnVault);
+    event MigrationEnginePrepared(
+        address indexed engine, address indexed earnVault, address indexed oldEngine, address forwarder, address owner
+    );
     event EngineDiscarded(address indexed engine, address indexed by);
     event StackCreated(
         address indexed engine,
@@ -208,6 +217,13 @@ contract VedaStackFactory {
     error ForwarderNotSeeded(address forwarder);
     error ForwarderNotRevoked(address forwarder);
     error InvalidEngineDeployment(address engine);
+    error InvalidMigrationTarget(address earnVault);
+    error InvalidMigrationSource(address earnVault, address engine);
+    error MigrationAssetMismatch(address earnVault, address expected, address actual);
+    error MigrationDisabled(address earnVault);
+    error MigrationTargetMissing(address engine);
+    error MigrationTargetReserved(address engine, address earnVault);
+    error NotEarnVaultOperator(address caller, address expected);
     error InvalidFactoryWiring(address account);
     error InvalidForwarderDeployment(address forwarder);
     error InvalidTransferPolicyAdmin(address admin);
@@ -329,6 +345,20 @@ contract VedaStackFactory {
         engine = _deployEngine(jobId, engineParams);
     }
 
+    /// @notice Builds an inert replacement Engine for one existing EarnVault. Its current operator
+    ///         must later finalize it before this factory grants any vault role.
+    function deployMigrationEngine(bytes32 jobId, EngineParams calldata engineParams, address earnVault)
+        external
+        onlyOperator
+        nonReentrant
+        returns (address engine)
+    {
+        _migrationOperator(earnVault);
+        engine = _deployEngine(jobId, engineParams);
+        migrationTargetOf[engine] = earnVault;
+        emit MigrationEngineDeployed(engine, earnVault);
+    }
+
     /// @notice Second half: builds the rest of the stack around an engine from {deployEngine}.
     /// @dev Parameters as in {createStack}.
     function finalizeStack(address engine, EarnFactory.DeployParams calldata core, address newTransferPolicyAdmin)
@@ -338,6 +368,39 @@ contract VedaStackFactory {
         returns (address earnVault, address earnShare)
     {
         (earnVault, earnShare) = _finalizeStack(engine, core, newTransferPolicyAdmin);
+    }
+
+    /// @notice Prepares an Engine for a later whole-pool migration. Only the existing EarnVault's
+    ///         current operator chooses to bind and authorize the committed candidate. No funds move.
+    function finalizeMigrationEngine(address engine) external nonReentrant returns (address forwarder) {
+        if (registrationsPaused) revert RegistrationsPaused();
+        StackRecord storage record = _stacks[engine];
+        if (record.status != EngineStatus.Pending) revert EngineNotPending(engine);
+        address earnVault = migrationTargetOf[engine];
+        if (earnVault == address(0)) revert MigrationTargetMissing(engine);
+        (address owner, address oldEngine) = _migrationOperator(earnVault);
+        if (msg.sender != owner) revert NotEarnVaultOperator(msg.sender, owner);
+        _requireAuthorizerBound();
+
+        VedaEngine candidate = VedaEngine(engine);
+        if (
+            candidate.owner() != address(this) || candidate.earnVault() != address(0)
+                || address(candidate.peripheryRegistry()) != address(registry)
+        ) revert InvalidEngineDeployment(engine);
+        uint64 engineVersion = candidate.peripheryVersion();
+        uint64 publishedVersion = registry.version();
+        if (engineVersion != publishedVersion) revert EnginePeripheryStale(engine, engineVersion, publishedVersion);
+
+        record.status = EngineStatus.Active;
+        forwarder = _deployForwarder(engine);
+        if (forwarder != address(0)) candidate.setAuthorizedForwarder(forwarder, true);
+        candidate.initializeEarnVault(earnVault, owner);
+        record.earnVault = earnVault;
+        record.createdAtBlock = uint64(block.number);
+        record.forwarder = forwarder;
+        _authorizeEngine(engine);
+        if (forwarder != address(0)) _authorizeForwarder(forwarder);
+        emit MigrationEnginePrepared(engine, earnVault, oldEngine, forwarder, owner);
     }
 
     /// @notice Builds and authorizes a forwarding solver for an active engine against the vault's
@@ -558,6 +621,8 @@ contract VedaStackFactory {
     {
         StackRecord storage record = _stacks[engine];
         if (record.status != EngineStatus.Pending) revert EngineNotPending(engine);
+        address reservedTarget = migrationTargetOf[engine];
+        if (reservedTarget != address(0)) revert MigrationTargetReserved(engine, reservedTarget);
         if (core.engine != address(0)) revert EngineMustBeUnset(core.engine);
         // An engine left with this factory as its owner could never be administered.
         if (core.owner == address(this)) revert FactoryCannotBeOwner();
@@ -606,6 +671,23 @@ contract VedaStackFactory {
         _authorizeEngine(engine);
         if (forwarder != address(0)) _authorizeForwarder(forwarder);
         emit StackCreated(engine, earnVault, earnShare, address(earnFees_), forwarder, core.owner, msg.sender);
+    }
+
+    /// @dev Checks live target state at both deployment and finalization. The source Engine's
+    ///      reciprocal binding prevents an unrelated EarnVault from claiming its position.
+    function _migrationOperator(address earnVault) private view returns (address owner, address oldEngine) {
+        if (earnVault.code.length == 0) revert InvalidMigrationTarget(earnVault);
+        IEarnVault target = IEarnVault(earnVault);
+        if (target.engineMigrationMode() != EngineMigrationMode.OperatorEnabled) revert MigrationDisabled(earnVault);
+        address expectedAsset = registry.baseAsset();
+        address actualAsset = target.asset();
+        if (actualAsset != expectedAsset) revert MigrationAssetMismatch(earnVault, expectedAsset, actualAsset);
+        oldEngine = target.engine();
+        if (oldEngine.code.length == 0 || IEarnEngine(oldEngine).earnVault() != earnVault) {
+            revert InvalidMigrationSource(earnVault, oldEngine);
+        }
+        owner = target.operator();
+        if (owner == address(0) || owner == address(this)) revert InvalidMigrationTarget(earnVault);
     }
 
     /// @dev Builds a forwarding solver for `engine` against the published Queue, Teller and stock

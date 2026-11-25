@@ -108,6 +108,10 @@ EarnVault's operator and the engine's owner. `core.transferPolicyId` is attached
 meaning unrestricted; a nonzero `newTransferPolicyAdmin` instead creates a TIP-403 whitelist
 administered by that address and attaches it. A protected stack is unusable until its policy's
 administrator authorizes the [required members](access.md#required-members).
+The factory passes `core.controls.migrationMode` through to `EarnFactory`: select
+`OperatorEnabled` at deployment if the EarnVault may later move its whole pool to another Engine.
+That choice cannot change afterward. For a production vault, set `core.owner` to its governance
+timelock if migration must require an admin transaction.
 
 The factory builds nothing, not even a pending engine, until the administrator names it on the
 granter (`AuthorizerNotBound`). It
@@ -137,15 +141,17 @@ solver adds a storage write to every forwarder built.
 core first and make it revert; finalize again under another `deploymentId`. Such a core is bound to
 nothing and holds nothing.
 
-| Caller        | Functions                                                                                             |
-| ------------- | ----------------------------------------------------------------------------------------------------- |
-| Operator      | `createStack`, `deployEngine`, `finalizeStack`, `deployForwarder`                                     |
-| Pausers       | `revokeEngine`, `revokeForwarder`, `pauseRegistrations`, `discardEngine`                              |
-| Administrator | The pausers' functions, `reinstateEngine`, `reinstateForwarder`, `resumeRegistrations`, `setOperator` |
+| Caller             | Functions                                                                                             |
+| ------------------ | ----------------------------------------------------------------------------------------------------- |
+| Operator           | `createStack`, `deployEngine`, `deployMigrationEngine`, `finalizeStack`, `deployForwarder`            |
+| EarnVault operator | `finalizeMigrationEngine` for an Engine committed to that EarnVault                                   |
+| Pausers            | `revokeEngine`, `revokeForwarder`, `pauseRegistrations`, `discardEngine`                              |
+| Administrator      | The pausers' functions, `reinstateEngine`, `reinstateForwarder`, `resumeRegistrations`, `setOperator` |
 
 Pausers are the accounts the BoringVault's authority allows to call that function on the factory;
 the administrator grants those capabilities to the vault's pause roles. Pausing and revoking only
-reduce what the factory and its stacks can do. A paused factory refuses every operator call.
+reduce what the factory and its stacks can do. A paused factory refuses every operator call and
+every migration candidate finalization.
 
 The records say what the factory last did, not what the module authorities permit now.
 `isEngineReady(engine)` checks the active factory record and the Engine's authority on its current
@@ -289,12 +295,40 @@ only for the tuple currently published.
 
 ### Moving an existing stack onto the vault
 
-The factory builds an Engine only with a new EarnVault. Moving an existing EarnVault here through
-[whole-pool engine migration](../architecture/system.md#whole-pool-engine-migration) still needs an
-administrator role grant for that Engine. Its owner deploys and binds the new Engine on this
-registry, the administrator grants its Engine role, and the EarnVault operator calls
-`migrateEngine`. This Engine is not in the factory's records; revoke its role directly if needed.
-A Teller with separate account admission also needs that admission before the stack can operate.
+The destination vault's factory can prepare a replacement Engine for an existing EarnVault without
+deploying another EarnVault, EarnShare or EarnFees:
+
+1. The factory operator calls `deployMigrationEngine(jobId, engineParams, existingEarnVault)`.
+   The Engine is committed to that EarnVault, factory-owned, unbound and unauthorized. An ordinary
+   `deployEngine` cannot use the migration path, and this candidate cannot become a fresh stack.
+2. The **current `EarnVault.operator()`** calls `finalizeMigrationEngine(engine)`. The factory checks
+   the target's `OperatorEnabled` mode, base asset, live source-Engine binding, and current registry
+   version. It binds the candidate, transfers Engine ownership to that operator, grants its Engine
+   role, and builds and authorizes a Queue forwarder when needed. This call moves no funds.
+3. The same EarnVault operator later calls
+   [`migrateEngine(newEngine, minNewEngineShares, minAssetsRetained)`](../architecture/system.md#whole-pool-engine-migration)
+   with reviewed floors. Finalization and migration may be in one timelock execution batch.
+
+The destination vault must have named its factory on the role granter during one-time setup. No
+per-migration destination vault admin role grant is needed after that. A prepared candidate's
+`stack(engine).status` is `Active` because it has roles, even while `EarnVault.engine()` still names
+the source Engine. Its `earnShare` and `earnFees` record fields remain zero. If preparation and
+migration are separate, recheck that the candidate's owner is still the EarnVault's current
+operator before execution. If the Queue is used, verify the forwarder's approved worker and live
+solver path; a role grant alone does not make the worker ready.
+
+`migrateEngine` needs zero open Earn async requests, a full immediate source-Teller redemption,
+and a successful destination deposit. The factory does not supply liquidity or migrate assets.
+After migration, revoke the old Engine's role through its source vault's factory or administrator.
+Discard unused pending candidates and revoke prepared candidates that will not be used. A Teller
+with separate account admission still needs that admission before the Engine can operate.
+
+The target and reciprocal source-Engine checks guard against mistakes. They do not prove that the
+existing EarnVault came from the pinned `EarnFactory`; that factory has no onchain registry of its
+deployments. A strict provenance policy would need approved source factories or a deployment
+registry. Funded contract tests exercise both same-vault and distinct-vault migration with mocks.
+Production use still needs a funded two-vault fork rehearsal with the real source buffer,
+destination cap, rates, roles, and migration floors.
 
 ### Replacing the factory
 
